@@ -1,0 +1,15 @@
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.docx
+*.DS_Store
+demucs/
+separated/
+events/
+old_events/
+__pycache__/
+*.pyc
+.env
+.claude/
