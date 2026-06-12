@@ -130,6 +130,57 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     print(f"Original: {original_dur:.1f}s | Cleaned: {cleaned_dur:.1f}s | Removed: {removed_dur:.1f}s ({len(events)} events)")
 
 
+def split_tracks(audio_path, out_dir, silence_db=40, min_silence=2.0, min_track=20.0, pad=0.5):
+    """Split a long recording into individual tracks at silent gaps.
+
+    silence_db   - level below reference (dB) treated as silence
+    min_silence  - minimum gap length (s) that marks a track boundary
+    min_track    - drop segments shorter than this (s)
+    pad          - padding (s) kept around each track's edges
+    """
+    y, sr = librosa.load(audio_path, sr=None, mono=False)
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
+
+    # Detect non-silent intervals on a mono mixdown.
+    mono = y.mean(axis=0)
+    intervals = librosa.effects.split(mono, top_db=silence_db)
+
+    # Merge intervals separated by less than min_silence into single tracks.
+    min_gap = int(min_silence * sr)
+    merged = []
+    for start, end in intervals:
+        if merged and start - merged[-1][1] < min_gap:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+
+    pad_samples = int(pad * sr)
+    min_track_samples = int(min_track * sr)
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+
+    count = 0
+    for start, end in merged:
+        if end - start < min_track_samples:
+            continue
+        s = max(0, start - pad_samples)
+        e = min(y.shape[1], end + pad_samples)
+        track = y[:, s:e]
+        if track.shape[0] == 1:
+            track = track[0]
+        count += 1
+        out_path = os.path.join(out_dir, f"{base}_track_{count:02d}.mp3")
+        sf.write(out_path, track.T if track.ndim > 1 else track, sr)
+        print(f"  Track {count:02d}: {s / sr:8.1f}s - {e / sr:8.1f}s  ({(e - s) / sr:6.1f}s)  -> {out_path}")
+
+    if count == 0:
+        print("No tracks found. Try lowering --silence-db or --min-silence.")
+    else:
+        print(f"Wrote {count} tracks to {out_dir}/")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Detect and remove unwanted audio events")
     parser.add_argument("input", help="Input audio file")
@@ -137,7 +188,23 @@ def main():
     parser.add_argument("--events-csv", help="Path to save/load events CSV")
     parser.add_argument("--detect-only", action="store_true", help="Only detect events, don't clean audio")
     parser.add_argument("--use-existing-events", help="Use events from an existing CSV instead of detecting")
+    parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
+    parser.add_argument("--out-dir", default="tracks", help="Output directory for --split (default: tracks)")
+    parser.add_argument("--silence-db", type=float, default=40, help="dB below peak treated as silence (default: 40)")
+    parser.add_argument("--min-silence", type=float, default=2.0, help="Min gap in seconds marking a track boundary (default: 2.0)")
+    parser.add_argument("--min-track", type=float, default=20.0, help="Drop tracks shorter than this many seconds (default: 20)")
     args = parser.parse_args()
+
+    if args.split:
+        print(f"Splitting {args.input} into tracks...")
+        split_tracks(
+            args.input,
+            args.out_dir,
+            silence_db=args.silence_db,
+            min_silence=args.min_silence,
+            min_track=args.min_track,
+        )
+        return
 
     if not args.detect_only and not args.output:
         parser.error("output path is required unless --detect-only is set")
