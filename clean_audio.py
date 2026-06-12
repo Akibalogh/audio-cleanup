@@ -145,6 +145,101 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     print(f"Original: {original_dur:.1f}s | Cleaned: {cleaned_dur:.1f}s | Removed: {removed_dur:.1f}s ({len(events)} events)")
 
 
+def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
+    """Repair detected events by stem-swapping instead of cutting.
+
+    For each event window, Demucs separates a padded snippet into
+    vocals vs. accompaniment; the event range is then replaced with the
+    accompaniment-only audio (music keeps playing, the cough/noise is
+    gone). The rest of the recording is untouched, so there is no
+    overall fidelity loss and no timing shift.
+
+    ctx     - extra context (s) around each event given to Demucs
+              (separation quality is poor at snippet edges)
+    fade_ms - crossfade between original and repaired audio at the
+              event boundaries
+    """
+    import shutil
+    import subprocess
+
+    y, sr = librosa.load(audio_path, sr=None, mono=False)
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
+    n_samples = y.shape[1]
+
+    events = sorted(events)
+
+    with tempfile.TemporaryDirectory(prefix="stemswap_") as tmp:
+        # 1. Write a padded snippet per event.
+        snippets = []
+        for i, (s_sec, e_sec) in enumerate(events):
+            ws = max(0, int((s_sec - ctx) * sr))
+            we = min(n_samples, int((e_sec + ctx) * sr))
+            snip = y[:, ws:we]
+            path = os.path.join(tmp, f"ev{i:03d}.wav")
+            sf.write(path, snip.T if snip.shape[0] > 1 else snip[0], sr)
+            snippets.append((path, ws, we))
+
+        # 2. Separate all snippets in one Demucs run (model loads once).
+        sep_dir = os.path.join(tmp, "sep")
+        cmd = [
+            sys.executable, "-m", "demucs",
+            "--two-stems", "vocals",
+            "-n", "htdemucs",
+            "-o", sep_dir,
+        ] + [p for p, _, _ in snippets]
+        print(f"Separating {len(snippets)} event snippets with Demucs...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Demucs separation failed. Is demucs installed in this venv? "
+                f"stderr:\n{result.stderr[-2000:]}"
+            )
+
+        # 3. Patch each event range with the accompaniment-only audio.
+        fade = int(sr * fade_ms / 1000)
+        repaired = y.copy()
+        for i, ((path, ws, we), (s_sec, e_sec)) in enumerate(zip(snippets, events)):
+            name = os.path.splitext(os.path.basename(path))[0]
+            music_path = os.path.join(sep_dir, "htdemucs", name, "no_vocals.wav")
+            music, _ = librosa.load(music_path, sr=sr, mono=False)
+            if music.ndim == 1:
+                music = music[np.newaxis, :]
+            if music.shape[0] != y.shape[0]:
+                music = np.tile(music.mean(axis=0, keepdims=True), (y.shape[0], 1))
+
+            # Event range within the snippet (offset by window start).
+            es = int(s_sec * sr) - ws
+            ee = int(e_sec * sr) - ws
+            es = max(0, es)
+            ee = min(music.shape[1], we - ws, ee)
+            if ee <= es:
+                continue
+
+            # Crossfade original -> music at entry, music -> original at exit,
+            # staying inside the context margins.
+            fi = min(fade, es)            # entry fade length
+            fo = min(fade, music.shape[1] - ee)  # exit fade length
+
+            patch = music[:, es - fi:ee + fo].copy()
+            dst_s = ws + es - fi
+            dst_e = ws + ee + fo
+            orig = repaired[:, dst_s:dst_e]
+
+            mix = np.ones(patch.shape[1])
+            if fi > 0:
+                mix[:fi] = np.linspace(0, 1, fi)
+            if fo > 0:
+                mix[-fo:] = np.linspace(1, 0, fo)
+            repaired[:, dst_s:dst_e] = patch * mix + orig * (1 - mix)
+            print(f"  Repaired event {i:03d}: {s_sec:.2f}s - {e_sec:.2f}s")
+
+    out = repaired[0] if repaired.shape[0] == 1 else repaired
+    sf.write(output_path, out.T if out.ndim > 1 else out, sr)
+    total = sum(e - s for s, e in events)
+    print(f"Repaired {len(events)} events ({total:.1f}s) in place -- duration unchanged.")
+
+
 def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
                  min_track=20.0, pad=0.5, cough_tol=1.0):
     """Split a long recording into individual tracks at quiet gaps.
@@ -263,6 +358,9 @@ def main():
                         help="Detection sensitivity preset; looser flags more events (default: strict)")
     parser.add_argument("--multi-pass", action="store_true",
                         help="Run detection at every sensitivity level and save one events CSV per level for comparison")
+    parser.add_argument("--method", choices=["stem", "cut"], default="stem",
+                        help="How to clean events: 'stem' replaces them with music-only audio via Demucs "
+                             "(no music lost, duration unchanged); 'cut' splices them out (default: stem)")
     args = parser.parse_args()
 
     if args.multi_pass:
@@ -314,8 +412,11 @@ def main():
             print(f"  Event {i:03d}: {s:.2f}s - {e:.2f}s (duration: {e - s:.2f}s)")
         return
 
-    print(f"Cleaning audio -> {args.output}")
-    remove_events(args.input, args.output, events)
+    print(f"Cleaning audio -> {args.output} (method: {args.method})")
+    if args.method == "stem":
+        repair_events(args.input, args.output, events)
+    else:
+        remove_events(args.input, args.output, events)
     print("Done.")
 
 

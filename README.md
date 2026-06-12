@@ -9,19 +9,28 @@ Everything lives in one script: [`clean_audio.py`](clean_audio.py).
 ## Requirements
 
 - Python 3.9+
-- `librosa`, `numpy`, `soundfile`
 
 ```bash
-pip install librosa numpy soundfile
+pip install -r requirements.txt
 ```
+
+`librosa`/`numpy`/`soundfile` cover detection, cutting, and splitting.
+`demucs`/`torch` are needed for the default stem-swap cleaning method.
 
 ## Usage
 
-### Detect and remove events (one step)
+### Detect and clean events (one step)
 
 ```bash
 python clean_audio.py input.mp3 output.mp3
 ```
+
+By default events are **repaired, not cut**: Demucs separates each event
+window into vocals vs. accompaniment, and the event range is replaced
+with the accompaniment-only audio. The music plays through uninterrupted,
+the recording's duration is unchanged, and audio outside the event
+windows is untouched. Use `--method cut` to splice events out instead
+(shorter output, loses the music under each event).
 
 ### Detect only (review before cleaning)
 
@@ -89,8 +98,11 @@ zero-crossing rate, and spectral rolloff, then flags frames where all
 four exceed percentile thresholds (the sensitivity preset). Flagged runs
 of 0.4–10s become events, padded slightly and merged when close together.
 
-**Cleaning** splices out the flagged time ranges with short crossfades at
-the cut points.
+**Cleaning** has two methods. `stem` (default): each event window plus a
+few seconds of context is separated by Demucs (htdemucs, two-stem); the
+event range is patched with the accompaniment-only stem, crossfaded at
+the edges, so no music is lost and timing is preserved. `cut`: the
+flagged ranges are spliced out with short crossfades.
 
 **Track splitting** measures frame loudness relative to the recording's
 loud content (95th percentile), finds sustained quiet runs, bridges short
