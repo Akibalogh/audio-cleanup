@@ -1,7 +1,7 @@
 # audio-cleanup
 
 Clean up long audio recordings: detect and remove unwanted audio events
-(coughs, retches, other transient noises), and split a single multi-hour
+(coughs and other transient noises), and split a single multi-hour
 recording into individual tracks.
 
 Everything lives in one script: [`clean_audio.py`](clean_audio.py).

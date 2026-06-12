@@ -5,7 +5,8 @@
 *.m4a
 *.docx
 *.DS_Store
-demucs/
+audio-cleanup-venv/
+.venv/
 separated/
 events/
 old_events/
