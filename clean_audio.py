@@ -19,8 +19,23 @@ import numpy as np
 import soundfile as sf
 
 
-def detect_events(audio_path, sr=16000):
-    """Detect unwanted audio events using spectral analysis."""
+# Detection sensitivity presets: percentile thresholds for each feature.
+# Lower percentiles flag more frames -> more (and longer) events detected.
+SENSITIVITY_PRESETS = {
+    "strict": {"rms": 86, "flat": 72, "zcr": 70, "roll": 62},   # current defaults
+    "medium": {"rms": 82, "flat": 68, "zcr": 66, "roll": 58},
+    "loose":  {"rms": 78, "flat": 64, "zcr": 62, "roll": 54},
+}
+
+
+def detect_events(audio_path, sr=16000, sensitivity="strict"):
+    """Detect unwanted audio events using spectral analysis.
+
+    sensitivity is one of SENSITIVITY_PRESETS ("strict", "medium", "loose").
+    Looser settings flag more events.
+    """
+    thr = SENSITIVITY_PRESETS[sensitivity]
+
     y, sr = librosa.load(audio_path, sr=sr, mono=True)
 
     frame = 4096
@@ -34,10 +49,10 @@ def detect_events(audio_path, sr=16000):
     rms_db = librosa.amplitude_to_db(rms, ref=np.max)
 
     score = (
-        (rms_db > np.percentile(rms_db, 86))
-        & (flat > np.percentile(flat, 72))
-        & (zcr > np.percentile(zcr, 70))
-        & (roll > np.percentile(roll, 62))
+        (rms_db > np.percentile(rms_db, thr["rms"]))
+        & (flat > np.percentile(flat, thr["flat"]))
+        & (zcr > np.percentile(zcr, thr["zcr"]))
+        & (roll > np.percentile(roll, thr["roll"]))
     )
 
     times = librosa.frames_to_time(np.arange(len(score)), sr=sr, hop_length=hop)
@@ -244,7 +259,27 @@ def main():
     parser.add_argument("--min-silence", type=float, default=3.0, help="Min sustained quiet in seconds marking a track boundary (default: 3.0)")
     parser.add_argument("--min-track", type=float, default=20.0, help="Drop tracks shorter than this many seconds (default: 20)")
     parser.add_argument("--cough-tol", type=float, default=1.0, help="Bridge over loud blips (coughs) up to this long in seconds (default: 1.0)")
+    parser.add_argument("--sensitivity", choices=sorted(SENSITIVITY_PRESETS), default="strict",
+                        help="Detection sensitivity preset; looser flags more events (default: strict)")
+    parser.add_argument("--multi-pass", action="store_true",
+                        help="Run detection at every sensitivity level and save one events CSV per level for comparison")
     args = parser.parse_args()
+
+    if args.multi_pass:
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        print(f"Multi-pass detection on {args.input}...")
+        results = {}
+        for level in ["strict", "medium", "loose"]:
+            events = detect_events(args.input, sensitivity=level)
+            csv_path = f"{base}_events_{level}.csv"
+            save_events_csv(events, csv_path)
+            total = sum(e - s for s, e in events)
+            results[level] = (len(events), total, csv_path)
+            print(f"  {level:>6}: {len(events):3d} events, {total:7.1f}s flagged -> {csv_path}")
+        print("\nCompare the CSVs (or spot-check clips), then clean with the level you like:")
+        best = results["strict"][2]
+        print(f"  python clean_audio.py '{args.input}' output.mp3 --use-existing-events {best}")
+        return
 
     if args.split:
         print(f"Splitting {args.input} into tracks...")
@@ -266,8 +301,8 @@ def main():
         events = load_events_csv(args.use_existing_events)
         print(f"Loaded {len(events)} events")
     else:
-        print(f"Detecting events in {args.input}...")
-        events = detect_events(args.input)
+        print(f"Detecting events in {args.input} (sensitivity: {args.sensitivity})...")
+        events = detect_events(args.input, sensitivity=args.sensitivity)
         print(f"Detected {len(events)} events")
 
     if args.events_csv:
