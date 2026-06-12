@@ -130,30 +130,80 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     print(f"Original: {original_dur:.1f}s | Cleaned: {cleaned_dur:.1f}s | Removed: {removed_dur:.1f}s ({len(events)} events)")
 
 
-def split_tracks(audio_path, out_dir, silence_db=40, min_silence=2.0, min_track=20.0, pad=0.5):
-    """Split a long recording into individual tracks at silent gaps.
+def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
+                 min_track=20.0, pad=0.5, cough_tol=1.0):
+    """Split a long recording into individual tracks at quiet gaps.
 
-    silence_db   - level below reference (dB) treated as silence
-    min_silence  - minimum gap length (s) that marks a track boundary
+    The gaps between tracks are rarely true silence -- there are coughs,
+    shuffles and ambient noise. So instead of strict silence detection we
+    look for *sustained low-energy* regions and tolerate brief loud blips
+    (coughs) inside them.
+
+    silence_db   - how many dB below the loud content counts as "quiet"
+    min_silence  - minimum sustained quiet length (s) that marks a boundary
     min_track    - drop segments shorter than this (s)
     pad          - padding (s) kept around each track's edges
+    cough_tol    - bridge over loud blips (coughs) up to this long (s)
+                   so a single cough doesn't break up a quiet gap
     """
     y, sr = librosa.load(audio_path, sr=None, mono=False)
     if y.ndim == 1:
         y = y[np.newaxis, :]
 
-    # Detect non-silent intervals on a mono mixdown.
     mono = y.mean(axis=0)
-    intervals = librosa.effects.split(mono, top_db=silence_db)
 
-    # Merge intervals separated by less than min_silence into single tracks.
-    min_gap = int(min_silence * sr)
-    merged = []
-    for start, end in intervals:
-        if merged and start - merged[-1][1] < min_gap:
-            merged[-1][1] = end
+    # Frame-level loudness in dB relative to the recording's loud content.
+    hop = 512
+    frame = 2048
+    rms = librosa.feature.rms(y=mono, frame_length=frame, hop_length=hop)[0]
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+
+    # Reference the "loud" level robustly (95th pct), not the single peak,
+    # so a stray transient doesn't skew the threshold.
+    loud = np.percentile(rms_db, 95)
+    quiet = rms_db < (loud - silence_db)
+
+    sec_per_frame = hop / sr
+    cough_frames = int(round(cough_tol / sec_per_frame))
+    min_gap_frames = int(round(min_silence / sec_per_frame))
+
+    # Morphological closing: fill short non-quiet holes (coughs) so they
+    # don't break an otherwise continuous quiet gap.
+    closed = quiet.copy()
+    i = 0
+    n = len(closed)
+    while i < n:
+        if not closed[i]:
+            j = i
+            while j < n and not closed[j]:
+                j += 1
+            run = j - i
+            # Only bridge if flanked by quiet on both sides.
+            if run <= cough_frames and i > 0 and j < n and closed[i - 1] and closed[j]:
+                closed[i:j] = True
+            i = j
         else:
-            merged.append([start, end])
+            i += 1
+
+    # Find sustained quiet runs >= min_silence -> these are boundary gaps.
+    gaps = []
+    i = 0
+    while i < n:
+        if closed[i]:
+            j = i
+            while j < n and closed[j]:
+                j += 1
+            if (j - i) >= min_gap_frames:
+                # Cut at the middle of the gap.
+                mid = (i + j) // 2
+                gaps.append(mid)
+            i = j
+        else:
+            i += 1
+
+    # Build track spans between consecutive gap midpoints.
+    cut_samples = [0] + [int(g * hop) for g in gaps] + [y.shape[1]]
+    spans = [(cut_samples[k], cut_samples[k + 1]) for k in range(len(cut_samples) - 1)]
 
     pad_samples = int(pad * sr)
     min_track_samples = int(min_track * sr)
@@ -162,7 +212,7 @@ def split_tracks(audio_path, out_dir, silence_db=40, min_silence=2.0, min_track=
     base = os.path.splitext(os.path.basename(audio_path))[0]
 
     count = 0
-    for start, end in merged:
+    for start, end in spans:
         if end - start < min_track_samples:
             continue
         s = max(0, start - pad_samples)
@@ -178,7 +228,7 @@ def split_tracks(audio_path, out_dir, silence_db=40, min_silence=2.0, min_track=
     if count == 0:
         print("No tracks found. Try lowering --silence-db or --min-silence.")
     else:
-        print(f"Wrote {count} tracks to {out_dir}/")
+        print(f"Found {len(gaps)} gaps -> wrote {count} tracks to {out_dir}/")
 
 
 def main():
@@ -190,9 +240,10 @@ def main():
     parser.add_argument("--use-existing-events", help="Use events from an existing CSV instead of detecting")
     parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
     parser.add_argument("--out-dir", default="tracks", help="Output directory for --split (default: tracks)")
-    parser.add_argument("--silence-db", type=float, default=40, help="dB below peak treated as silence (default: 40)")
-    parser.add_argument("--min-silence", type=float, default=2.0, help="Min gap in seconds marking a track boundary (default: 2.0)")
+    parser.add_argument("--silence-db", type=float, default=35, help="dB below loud content treated as quiet (default: 35)")
+    parser.add_argument("--min-silence", type=float, default=3.0, help="Min sustained quiet in seconds marking a track boundary (default: 3.0)")
     parser.add_argument("--min-track", type=float, default=20.0, help="Drop tracks shorter than this many seconds (default: 20)")
+    parser.add_argument("--cough-tol", type=float, default=1.0, help="Bridge over loud blips (coughs) up to this long in seconds (default: 1.0)")
     args = parser.parse_args()
 
     if args.split:
@@ -203,6 +254,7 @@ def main():
             silence_db=args.silence_db,
             min_silence=args.min_silence,
             min_track=args.min_track,
+            cough_tol=args.cough_tol,
         )
         return
 
