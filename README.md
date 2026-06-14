@@ -108,15 +108,23 @@ flagged ranges are spliced out with short crossfades.
 loud content (95th percentile), finds sustained quiet runs, bridges short
 loud blips inside them, and cuts at each gap's midpoint.
 
+## Folder layout
+
+```
+raw/        original recordings (gitignored)
+events/     detected event CSVs + review clips (gitignored)
+output/     cleaned audio and split tracks (gitignored)
+```
+
 ## Typical workflow for a long recording
 
 ```bash
 # 1. Compare detection sensitivities
-python clean_audio.py recording.mp3 --multi-pass
+python clean_audio.py raw/recording.mp3 --multi-pass
 
 # 2. Clean with the level you picked
-python clean_audio.py recording.mp3 cleaned.mp3 --use-existing-events recording_events_strict.csv
+python clean_audio.py raw/recording.mp3 output/cleaned.mp3 --use-existing-events recording_events_strict.csv
 
 # 3. Split the cleaned file into tracks
-python clean_audio.py cleaned.mp3 --split --out-dir tracks
+python clean_audio.py output/cleaned.mp3 --split --out-dir output/tracks
 ```
