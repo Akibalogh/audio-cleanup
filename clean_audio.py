@@ -107,8 +107,8 @@ def _ensure_panns_data():
         urllib.request.urlretrieve(url, path)
 
 
-def detect_events_panns(audio_path, threshold=0.05, win=1.0, hop_sec=0.5,
-                        pad=0.15, classes=None):
+def detect_events_panns(audio_path, threshold=0.3, win=1.0, hop_sec=0.5,
+                        pad=0.15, classes=None, extend_ratio=0.33):
     """Detect noise events with a pretrained AudioSet tagger (PANNs).
 
     Unlike the spectral heuristic, this recognises actual sound classes
@@ -138,6 +138,11 @@ def detect_events_panns(audio_path, threshold=0.05, win=1.0, hop_sec=0.5,
     win_n = int(win * sr)
     hop_n = int(hop_sec * sr)
     starts = list(range(0, max(1, len(y) - win_n + 1), hop_n))
+    # Cover the final partial window too, so an event in the last second
+    # of a file isn't invisible.
+    if starts and starts[-1] + win_n < len(y):
+        starts.append(max(0, len(y) - win_n))
+    y = np.pad(y, (0, max(0, (starts[-1] + win_n) - len(y))))
 
     # Batch windows through the model for speed.
     batch = 32
@@ -152,7 +157,23 @@ def detect_events_panns(audio_path, threshold=0.05, win=1.0, hop_sec=0.5,
             print(f"  scanning... {pct:.0f}%", flush=True)
 
     scores = np.array(scores)
-    active = scores >= threshold
+
+    # Hysteresis: a window must clearly exceed the threshold to start an
+    # event, but neighbouring windows only need to stay above a lower
+    # bound to extend it. Avoids both false positives on music and
+    # events truncated mid-cough.
+    active = np.zeros(len(scores), dtype=bool)
+    low = threshold * extend_ratio
+    for c in np.where(scores >= threshold)[0]:
+        active[c] = True
+        k = c - 1
+        while k >= 0 and scores[k] >= low:
+            active[k] = True
+            k -= 1
+        k = c + 1
+        while k < len(scores) and scores[k] >= low:
+            active[k] = True
+            k += 1
 
     # Group consecutive active windows into events.
     events = []
@@ -218,9 +239,13 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
             continue
 
         segment = y[:, prev_end:start_sample].copy()
-        if segment.shape[1] > fade_samples:
-            fade_out = np.linspace(1, 0, fade_samples)
-            segment[:, -fade_samples:] *= fade_out
+        if segment.shape[1] > 2 * fade_samples:
+            # Fade in at every splice joint (but not at the very start of
+            # the file), otherwise a fade-to-zero meets an abrupt
+            # full-level start and clicks.
+            if prev_end > 0:
+                segment[:, :fade_samples] *= np.linspace(0, 1, fade_samples)
+            segment[:, -fade_samples:] *= np.linspace(1, 0, fade_samples)
         segments.append(segment)
         prev_end = end_sample
 
@@ -247,8 +272,48 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     print(f"Original: {original_dur:.1f}s | Cleaned: {cleaned_dur:.1f}s | Removed: {removed_dur:.1f}s ({len(events)} events)")
 
 
-def inpaint_events(audio_path, output_path, events, fade_ms=30,
-                   margin=1.6, floor_gain=0.25):
+def _localize_transient(y, sr, ev_s, ev_e, pad=0.06, min_len=0.15):
+    """Narrow a flagged window down to the transient burst inside it.
+
+    The tagger reports ~1-4s windows, but a cough is a ~0.4s burst. This
+    finds the loud region within the window using a short-time energy
+    envelope and returns just that span, so the repair touches as little
+    audio as possible.
+    """
+    a, b = int(ev_s * sr), int(ev_e * sr)
+    a, b = max(0, a), min(y.shape[1], b)
+    if b - a < int(min_len * sr):
+        return ev_s, ev_e
+
+    seg = y[:, a:b].mean(axis=0)
+    step = max(1, int(0.010 * sr))          # 10ms envelope
+    frames = [np.abs(seg[i:i + step]).max() for i in range(0, len(seg) - step, step)]
+    if len(frames) < 5:
+        return ev_s, ev_e
+    env = 20 * np.log10(np.array(frames) + 1e-12)
+
+    # Baseline = the quiet part of the window; the burst is what rises
+    # clearly above it.
+    base = np.percentile(env, 25)
+    peak = env.max()
+    if peak - base < 6.0:                   # no clear transient; keep as-is
+        return ev_s, ev_e
+    thr = base + 0.35 * (peak - base)
+
+    above = np.where(env >= thr)[0]
+    if len(above) == 0:
+        return ev_s, ev_e
+    lo, hi = above[0], above[-1] + 1
+
+    s = ev_s + max(0.0, lo * step / sr - pad)
+    e = ev_s + min((b - a) / sr, hi * step / sr + pad)
+    if e - s < min_len:                     # don't over-narrow
+        mid = 0.5 * (s + e)
+        s, e = mid - min_len / 2, mid + min_len / 2
+    return max(ev_s, s), min(ev_e, e)
+
+
+def inpaint_events(audio_path, output_path, events, fade_ms=30):
     """Repair events by spectral inpainting -- the highest-fidelity method.
 
     Rather than replacing the event window wholesale (which blanks out any
@@ -275,55 +340,89 @@ def inpaint_events(audio_path, output_path, events, fade_ms=30,
     guard = 0.75           # seconds of clean context sampled either side
     fade = int(sr * fade_ms / 1000)
 
+    events = sorted(events)
+    smooth_k = np.array([0.25, 0.5, 0.25])
+
     repaired = y.copy()
-    for idx, (s_sec, e_sec) in enumerate(sorted(events)):
+    for idx, (ev_s, ev_e) in enumerate(events):
+        # Narrow the flagged window down to the actual transient. PANNs
+        # windows run 1-4s but a cough lasts ~0.4s, so repairing the whole
+        # window would needlessly process seconds of good music.
+        s_sec, e_sec = _localize_transient(y, sr, ev_s, ev_e)
+
         s_smp = max(0, int(s_sec * sr) - fade)
         e_smp = min(y.shape[1], int(e_sec * sr) + fade)
         if e_smp - s_smp < n_fft:
             continue
 
+        # Guard regions: clean context either side, truncated at file
+        # edges rather than dropped, and never overlapping a neighbouring
+        # event (whose cough would corrupt the reference).
+        g = int(guard * sr)
+        pre_lo = max(0, s_smp - g)
+        if idx > 0:
+            pre_lo = max(pre_lo, min(s_smp, int(events[idx - 1][1] * sr)))
+        post_hi = min(y.shape[1], e_smp + g)
+        if idx + 1 < len(events):
+            post_hi = min(post_hi, max(e_smp, int(events[idx + 1][0] * sr)))
+
+        if pre_lo >= s_smp and e_smp >= post_hi:
+            continue
+
+        # One gain mask, computed from the mid signal and applied to both
+        # channels, so the stereo image doesn't shift inside the event.
+        mid = y[:, s_smp:e_smp].mean(axis=0)
+        D_mid = librosa.stft(mid, n_fft=n_fft, hop_length=hop)
+        mag_mid = np.abs(D_mid)
+
+        def _ref_mag(lo, hi):
+            if hi - lo < n_fft:
+                return None
+            r = y[:, lo:hi].mean(axis=0)
+            return np.abs(librosa.stft(r, n_fft=n_fft, hop_length=hop))
+
+        pre_ref = _ref_mag(pre_lo, s_smp)
+        post_ref = _ref_mag(e_smp, post_hi)
+        if pre_ref is None and post_ref is None:
+            continue
+
+        # Median (not max) is the robust estimate of what the context
+        # typically holds in each band; max would be set by any transient
+        # in the guard and would leave the cough untouched.
+        pre_med = np.median(pre_ref, axis=1) if pre_ref is not None else None
+        post_med = np.median(post_ref, axis=1) if post_ref is not None else None
+        if pre_med is None:
+            pre_med = post_med
+        if post_med is None:
+            post_med = pre_med
+
+        # Interpolate the expected spectrum across the event so music that
+        # evolves through it is tracked rather than flattened.
+        n_frames = mag_mid.shape[1]
+        ramp = np.linspace(0, 1, n_frames)[np.newaxis, :]
+        target = pre_med[:, None] * (1 - ramp) + post_med[:, None] * ramp
+
+        # Attenuate down to the expected spectrum with no floor: a cough
+        # sits 25-35dB above quiet ambience, so a -12dB limit would only
+        # make it quieter, not remove it.
+        gain = np.ones_like(mag_mid)
+        np.divide(target, mag_mid, out=gain, where=mag_mid > target)
+        gain = np.clip(gain, 0.0, 1.0)
+
+        # Smooth the gain, normalising by a smoothed all-ones matrix so
+        # the kernel's edge taper doesn't attenuate the first/last frame.
+        def _smooth(a, axis):
+            if a.shape[axis] < 3:
+                return a
+            return np.apply_along_axis(lambda v: np.convolve(v, smooth_k, mode="same"), axis, a)
+        norm = _smooth(_smooth(np.ones_like(gain), 1), 0)
+        gain = _smooth(_smooth(gain, 1), 0) / np.maximum(norm, 1e-9)
+        gain = np.clip(gain, 0.0, 1.0)
+
         for ch in range(y.shape[0]):
             seg = y[ch, s_smp:e_smp]
             D = librosa.stft(seg, n_fft=n_fft, hop_length=hop)
-            mag, phase = np.abs(D), np.angle(D)
-
-            # Reference spectrum from clean audio just outside the event.
-            g = int(guard * sr)
-            ref_parts = []
-            if s_smp - g >= 0:
-                ref_parts.append(y[ch, s_smp - g:s_smp])
-            if e_smp + g <= y.shape[1]:
-                ref_parts.append(y[ch, e_smp:e_smp + g])
-            if not ref_parts:
-                continue
-            ref = np.concatenate(ref_parts)
-            if len(ref) < n_fft:
-                continue
-            ref_mag = np.abs(librosa.stft(ref, n_fft=n_fft, hop_length=hop))
-
-            # Per-frequency ceiling: the loudest the surrounding music
-            # normally reaches in each band. Only energy clearly ABOVE
-            # this is the intruding noise; a margin keeps normal musical
-            # variation from being treated as excess.
-            ceiling = ref_mag.max(axis=1, keepdims=True) * margin
-
-            # Attenuate only bins that exceed the ceiling, and only down
-            # to the ceiling itself -- never below, so the underlying
-            # music and voice keep their level.
-            gain = np.ones_like(mag)
-            over = mag > ceiling
-            np.divide(ceiling, mag, out=gain, where=over & (mag > 0))
-            gain = np.clip(gain, floor_gain, 1.0)
-
-            # Smooth the gain across time and frequency so the correction
-            # is gradual rather than a hard spectral hole.
-            if gain.shape[1] >= 3:
-                k = np.array([0.25, 0.5, 0.25])
-                gain = np.apply_along_axis(lambda r: np.convolve(r, k, mode="same"), 1, gain)
-            if gain.shape[0] >= 3:
-                gain = np.apply_along_axis(lambda c: np.convolve(c, k, mode="same"), 0, gain)
-
-            out = librosa.istft(gain * mag * np.exp(1j * phase),
+            out = librosa.istft(gain * np.abs(D) * np.exp(1j * np.angle(D)),
                                 hop_length=hop, length=len(seg))
 
             # Crossfade the repaired segment back in at the edges.
@@ -333,7 +432,8 @@ def inpaint_events(audio_path, output_path, events, fade_ms=30,
                 mix[-fade:] = np.linspace(1, 0, fade)
             repaired[ch, s_smp:e_smp] = out * mix + seg * (1 - mix)
 
-        print(f"  Inpainted event {idx:03d}: {s_sec:.2f}s - {e_sec:.2f}s")
+        print(f"  Inpainted event {idx:03d}: {s_sec:.2f}s - {e_sec:.2f}s "
+              f"(from {ev_s:.2f}-{ev_e:.2f})")
 
     out = repaired[0] if repaired.shape[0] == 1 else repaired
     sf.write(output_path, out.T if out.ndim > 1 else out, sr)
@@ -497,9 +597,19 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
             run_start = k
     runs.append((run_start, len(is_music), is_music[-1]))
 
-    # Merge out runs too short to be a real passage.
-    stable = [r for r in runs if r[1] - r[0] >= min_run]
-    boundaries = [r[0] for r in stable[1:]]
+    # Drop runs too short to be a real passage, then merge neighbours
+    # that share a label -- otherwise a brief applause swell inside a
+    # song would leave two adjacent "music" runs and cut mid-song.
+    stable = [list(r) for r in runs if r[1] - r[0] >= min_run]
+    merged_runs = []
+    for r in stable:
+        if merged_runs and merged_runs[-1][2] == r[2]:
+            merged_runs[-1][1] = r[1]
+        else:
+            merged_runs.append(r)
+
+    # Boundaries only at real music <-> non-music transitions.
+    boundaries = [r[0] for r in merged_runs[1:]]
 
     cuts = [0] + [starts[b] for b in boundaries] + [len(y)]
     orig, osr = librosa.load(audio_path, sr=None, mono=False)
@@ -660,8 +770,9 @@ def main():
     parser.add_argument("--detector", choices=["panns", "spectral"], default="panns",
                         help="Event detector: 'panns' recognises cough/throat-clearing/sneeze via a pretrained "
                              "AudioSet model; 'spectral' uses the loudness/noisiness heuristic (default: panns)")
-    parser.add_argument("--threshold", type=float, default=0.05,
-                        help="PANNs class probability needed to flag an event (default: 0.05; lower finds more)")
+    parser.add_argument("--threshold", type=float, default=0.3,
+                        help="PANNs class probability needed to flag an event (default: 0.3; lower finds more). "
+                             "True coughs score ~0.5-0.7; music sits below ~0.1")
     args = parser.parse_args()
 
     if args.multi_pass:
