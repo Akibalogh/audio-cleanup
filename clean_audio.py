@@ -78,6 +78,108 @@ def detect_events(audio_path, sr=16000, sensitivity="strict"):
     return merged
 
 
+# AudioSet classes that represent unwanted noise events.
+NOISE_CLASSES = ["Cough", "Throat clearing", "Sneeze"]
+
+PANNS_CHECKPOINT_URL = "https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1"
+PANNS_LABELS_URL = ("http://storage.googleapis.com/us_audioset/youtube_corpus/"
+                    "v1/csv/class_labels_indices.csv")
+
+
+def _ensure_panns_data():
+    """Download the PANNs checkpoint and label file if missing.
+
+    panns_inference shells out to `wget`, which is often absent on macOS,
+    so fetch them here with urllib instead.
+    """
+    import urllib.request
+
+    data_dir = os.path.join(os.path.expanduser("~"), "panns_data")
+    os.makedirs(data_dir, exist_ok=True)
+    targets = [
+        (os.path.join(data_dir, "class_labels_indices.csv"), PANNS_LABELS_URL, "labels"),
+        (os.path.join(data_dir, "Cnn14_mAP=0.431.pth"), PANNS_CHECKPOINT_URL, "model checkpoint (~320MB)"),
+    ]
+    for path, url, what in targets:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            continue
+        print(f"Downloading PANNs {what} -> {path}")
+        urllib.request.urlretrieve(url, path)
+
+
+def detect_events_panns(audio_path, threshold=0.05, win=1.0, hop_sec=0.5,
+                        pad=0.15, classes=None):
+    """Detect noise events with a pretrained AudioSet tagger (PANNs).
+
+    Unlike the spectral heuristic, this recognises actual sound classes
+    (cough, throat clearing, sneeze) rather than guessing from loudness
+    and noisiness, so it is far more accurate on music. It also returns
+    tight windows around each event, which the inpainting repair needs.
+
+    threshold - minimum class probability to flag a window
+    win       - analysis window length (s)
+    hop_sec   - step between windows (s)
+    pad       - padding added around each detected event (s)
+    """
+    _ensure_panns_data()
+    from panns_inference import AudioTagging
+    from panns_inference.config import labels
+
+    classes = classes or NOISE_CLASSES
+    idxs = [labels.index(c) for c in classes if c in labels]
+    if not idxs:
+        raise ValueError(f"No matching AudioSet classes for {classes}")
+
+    sr = 32000  # PANNs is trained at 32kHz
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+
+    at = AudioTagging(checkpoint_path=None, device="cpu")
+
+    win_n = int(win * sr)
+    hop_n = int(hop_sec * sr)
+    starts = list(range(0, max(1, len(y) - win_n + 1), hop_n))
+
+    # Batch windows through the model for speed.
+    batch = 32
+    scores = []
+    for i in range(0, len(starts), batch):
+        chunk = starts[i:i + batch]
+        block = np.stack([y[s:s + win_n] for s in chunk])
+        out = at.inference(block)[0]
+        scores.extend(out[:, idxs].max(axis=1).tolist())
+        if (i // batch) % 20 == 0:
+            pct = 100 * min(i + batch, len(starts)) / len(starts)
+            print(f"  scanning... {pct:.0f}%", flush=True)
+
+    scores = np.array(scores)
+    active = scores >= threshold
+
+    # Group consecutive active windows into events.
+    events = []
+    run_start = None
+    for k, on in enumerate(active):
+        if on and run_start is None:
+            run_start = k
+        elif not on and run_start is not None:
+            s = starts[run_start] / sr
+            e = (starts[k - 1] + win_n) / sr
+            events.append((max(0.0, s - pad), e + pad))
+            run_start = None
+    if run_start is not None:
+        s = starts[run_start] / sr
+        e = (starts[-1] + win_n) / sr
+        events.append((max(0.0, s - pad), e + pad))
+
+    # Merge events that nearly touch.
+    merged = []
+    for s, e in events:
+        if merged and s - merged[-1][1] < 0.3:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
 def save_events_csv(events, path):
     """Save detected events to a CSV file."""
     with open(path, "w", newline="") as f:
@@ -143,6 +245,100 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     cleaned_dur = cleaned.shape[-1] / sr
     removed_dur = original_dur - cleaned_dur
     print(f"Original: {original_dur:.1f}s | Cleaned: {cleaned_dur:.1f}s | Removed: {removed_dur:.1f}s ({len(events)} events)")
+
+
+def inpaint_events(audio_path, output_path, events, fade_ms=30,
+                   margin=1.6, floor_gain=0.25):
+    """Repair events by spectral inpainting -- the highest-fidelity method.
+
+    Rather than replacing the event window wholesale (which blanks out any
+    singing or music underneath, causing an audible dropout), this works
+    per time-frequency cell: for each STFT bin inside the event, the
+    magnitude is capped at what the surrounding music predicts, and only
+    the excess energy -- the cough itself -- is removed. Music and voice
+    that continue through the event are preserved, so there is no dip in
+    level.
+
+    Phase is left untouched, which keeps the underlying material coherent.
+
+    margin     - how far above the local maximum a bin must sit before it
+                 counts as noise (1.0 = any excess; higher = more surgical)
+    floor_gain - most any single bin may be attenuated (0.25 = -12dB max),
+                 which prevents spectral holes and audible level dips
+    """
+    y, sr = librosa.load(audio_path, sr=None, mono=False)
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
+
+    n_fft = 2048
+    hop = 512
+    guard = 0.75           # seconds of clean context sampled either side
+    fade = int(sr * fade_ms / 1000)
+
+    repaired = y.copy()
+    for idx, (s_sec, e_sec) in enumerate(sorted(events)):
+        s_smp = max(0, int(s_sec * sr) - fade)
+        e_smp = min(y.shape[1], int(e_sec * sr) + fade)
+        if e_smp - s_smp < n_fft:
+            continue
+
+        for ch in range(y.shape[0]):
+            seg = y[ch, s_smp:e_smp]
+            D = librosa.stft(seg, n_fft=n_fft, hop_length=hop)
+            mag, phase = np.abs(D), np.angle(D)
+
+            # Reference spectrum from clean audio just outside the event.
+            g = int(guard * sr)
+            ref_parts = []
+            if s_smp - g >= 0:
+                ref_parts.append(y[ch, s_smp - g:s_smp])
+            if e_smp + g <= y.shape[1]:
+                ref_parts.append(y[ch, e_smp:e_smp + g])
+            if not ref_parts:
+                continue
+            ref = np.concatenate(ref_parts)
+            if len(ref) < n_fft:
+                continue
+            ref_mag = np.abs(librosa.stft(ref, n_fft=n_fft, hop_length=hop))
+
+            # Per-frequency ceiling: the loudest the surrounding music
+            # normally reaches in each band. Only energy clearly ABOVE
+            # this is the intruding noise; a margin keeps normal musical
+            # variation from being treated as excess.
+            ceiling = ref_mag.max(axis=1, keepdims=True) * margin
+
+            # Attenuate only bins that exceed the ceiling, and only down
+            # to the ceiling itself -- never below, so the underlying
+            # music and voice keep their level.
+            gain = np.ones_like(mag)
+            over = mag > ceiling
+            np.divide(ceiling, mag, out=gain, where=over & (mag > 0))
+            gain = np.clip(gain, floor_gain, 1.0)
+
+            # Smooth the gain across time and frequency so the correction
+            # is gradual rather than a hard spectral hole.
+            if gain.shape[1] >= 3:
+                k = np.array([0.25, 0.5, 0.25])
+                gain = np.apply_along_axis(lambda r: np.convolve(r, k, mode="same"), 1, gain)
+            if gain.shape[0] >= 3:
+                gain = np.apply_along_axis(lambda c: np.convolve(c, k, mode="same"), 0, gain)
+
+            out = librosa.istft(gain * mag * np.exp(1j * phase),
+                                hop_length=hop, length=len(seg))
+
+            # Crossfade the repaired segment back in at the edges.
+            mix = np.ones(len(seg))
+            if fade > 0 and len(seg) > 2 * fade:
+                mix[:fade] = np.linspace(0, 1, fade)
+                mix[-fade:] = np.linspace(1, 0, fade)
+            repaired[ch, s_smp:e_smp] = out * mix + seg * (1 - mix)
+
+        print(f"  Inpainted event {idx:03d}: {s_sec:.2f}s - {e_sec:.2f}s")
+
+    out = repaired[0] if repaired.shape[0] == 1 else repaired
+    sf.write(output_path, out.T if out.ndim > 1 else out, sr)
+    total = sum(e - s for s, e in events)
+    print(f"Inpainted {len(events)} events ({total:.1f}s) -- level and duration preserved.")
 
 
 def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
@@ -358,9 +554,15 @@ def main():
                         help="Detection sensitivity preset; looser flags more events (default: strict)")
     parser.add_argument("--multi-pass", action="store_true",
                         help="Run detection at every sensitivity level and save one events CSV per level for comparison")
-    parser.add_argument("--method", choices=["stem", "cut"], default="stem",
-                        help="How to clean events: 'stem' replaces them with music-only audio via Demucs "
-                             "(no music lost, duration unchanged); 'cut' splices them out (default: stem)")
+    parser.add_argument("--method", choices=["inpaint", "stem", "cut"], default="inpaint",
+                        help="How to clean events: 'inpaint' removes only the noise energy and keeps music/voice "
+                             "underneath (highest fidelity, no level dip); 'stem' swaps in Demucs music-only audio; "
+                             "'cut' splices them out (default: inpaint)")
+    parser.add_argument("--detector", choices=["panns", "spectral"], default="panns",
+                        help="Event detector: 'panns' recognises cough/throat-clearing/sneeze via a pretrained "
+                             "AudioSet model; 'spectral' uses the loudness/noisiness heuristic (default: panns)")
+    parser.add_argument("--threshold", type=float, default=0.05,
+                        help="PANNs class probability needed to flag an event (default: 0.05; lower finds more)")
     args = parser.parse_args()
 
     if args.multi_pass:
@@ -399,8 +601,12 @@ def main():
         events = load_events_csv(args.use_existing_events)
         print(f"Loaded {len(events)} events")
     else:
-        print(f"Detecting events in {args.input} (sensitivity: {args.sensitivity})...")
-        events = detect_events(args.input, sensitivity=args.sensitivity)
+        if args.detector == "panns":
+            print(f"Detecting events in {args.input} (PANNs, threshold {args.threshold})...")
+            events = detect_events_panns(args.input, threshold=args.threshold)
+        else:
+            print(f"Detecting events in {args.input} (spectral, sensitivity: {args.sensitivity})...")
+            events = detect_events(args.input, sensitivity=args.sensitivity)
         print(f"Detected {len(events)} events")
 
     if args.events_csv:
@@ -413,7 +619,9 @@ def main():
         return
 
     print(f"Cleaning audio -> {args.output} (method: {args.method})")
-    if args.method == "stem":
+    if args.method == "inpaint":
+        inpaint_events(args.input, args.output, events)
+    elif args.method == "stem":
         repair_events(args.input, args.output, events)
     else:
         remove_events(args.input, args.output, events)
