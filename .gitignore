@@ -7,7 +7,6 @@
 *.DS_Store
 audio-cleanup-venv/
 .venv/
-separated/
 events/
 old_events/
 __pycache__/
