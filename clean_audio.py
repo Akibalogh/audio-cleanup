@@ -561,7 +561,7 @@ def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
 
 
 def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
-                win=1.0, hop_sec=1.0):
+                win=1.0, hop_sec=1.0, music_only=False):
     """Split a concert recording into individual songs.
 
     Songs at a live show are separated by applause and talking, not by
@@ -632,10 +632,16 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
         else:
             merged_runs.append(r)
 
-    # Boundaries only at real music <-> non-music transitions.
-    boundaries = [r[0] for r in merged_runs[1:]]
+    # Each surviving run is a passage; its label says whether it is
+    # music. Segments must carry that label -- the passages *between*
+    # songs are spoken, and writing them as "song_NN" would be wrong.
+    if not merged_runs:
+        print("No passages found. Try lowering --min-song.")
+        return
 
-    cuts = [0] + [starts[b] for b in boundaries] + [len(y)]
+    segments = [(starts[r[0]], starts[r[1]] if r[1] < len(starts) else len(y), r[2])
+                for r in merged_runs]
+
     orig, osr = librosa.load(audio_path, sr=None, mono=False)
     if orig.ndim == 1:
         orig = orig[np.newaxis, :]
@@ -645,24 +651,32 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
     base = os.path.splitext(os.path.basename(audio_path))[0]
     pad_n = int(pad * osr)
 
-    count = 0
-    for a, b in zip(cuts, cuts[1:]):
+    n_song = n_talk = 0
+    for a, b, musical in segments:
         if (b - a) / sr < min_song:
+            continue
+        if not musical and music_only:
             continue
         s = max(0, int(a * scale) - pad_n)
         e = min(orig.shape[1], int(b * scale) + pad_n)
         seg = orig[:, s:e]
         if seg.shape[0] == 1:
             seg = seg[0]
-        count += 1
-        path = os.path.join(out_dir, f"{base}_song_{count:02d}.flac")
+        if musical:
+            n_song += 1
+            path = os.path.join(out_dir, f"{base}_song_{n_song:02d}.flac")
+            kind = f"Song {n_song:02d}"
+        else:
+            n_talk += 1
+            path = os.path.join(out_dir, f"{base}_talk_{n_talk:02d}.flac")
+            kind = f"Talk {n_talk:02d}"
         _write_audio(path, seg, osr)
-        print(f"  Song {count:02d}: {s / osr:8.1f}s - {e / osr:8.1f}s  ({(e - s) / osr:6.1f}s)  -> {path}")
+        print(f"  {kind}: {s / osr:8.1f}s - {e / osr:8.1f}s  ({(e - s) / osr:6.1f}s)  -> {path}")
 
-    if count == 0:
-        print("No songs found. Try lowering --min-song.")
+    if n_song == 0 and n_talk == 0:
+        print("No passages long enough. Try lowering --min-song.")
     else:
-        print(f"Found {len(boundaries)} boundaries -> wrote {count} songs to {out_dir}/")
+        print(f"Wrote {n_song} songs and {n_talk} spoken passages to {out_dir}/")
 
 
 def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
@@ -776,6 +790,8 @@ def main():
     parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
     parser.add_argument("--split-songs", action="store_true",
                         help="Split a concert into individual songs using music vs. applause/speech boundaries")
+    parser.add_argument("--music-only", action="store_true",
+                        help="Write only musical passages, skipping the spoken sections between them")
     parser.add_argument("--min-song", type=float, default=45.0,
                         help="Drop songs shorter than this many seconds (default: 45)")
     parser.add_argument("--out-dir", default="tracks", help="Output directory for --split (default: tracks)")
@@ -820,7 +836,8 @@ def main():
 
     if args.split_songs:
         print(f"Splitting {args.input} into songs...")
-        split_songs(args.input, args.out_dir, min_song=args.min_song)
+        split_songs(args.input, args.out_dir, min_song=args.min_song,
+                    music_only=args.music_only)
         return
 
     if args.split:
