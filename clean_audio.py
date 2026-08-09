@@ -560,8 +560,97 @@ def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
     print(f"Repaired {len(events)} events ({total:.1f}s) in place -- duration unchanged.")
 
 
+def _musical_change_points(y, sr, res=1.0, half=25.0, prom=0.25,
+                           min_gap=90.0, ratio=1.8, ctx=45.0):
+    """Find where one song gives way to another inside a musical passage.
+
+    Consecutive songs are often played back to back with no talking or
+    pause between them, so the Music-vs-Speech split leaves them merged.
+    A new song shows up as a change in timbre (different voice, different
+    language) and harmony (different melody, different key), which is
+    what MFCC + chroma capture.
+
+    Foote novelty over a self-similarity matrix proposes candidates; each
+    is then kept only if the audio either side really differs by more
+    than `ratio` times the track's own typical variation, which rejects
+    peaks caused by ordinary variation within one song.
+
+    Returns offsets in seconds from the start of `y`.
+    """
+    from scipy.signal import find_peaks
+
+    hop = 1024
+    fps = sr / hop
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=hop)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+
+    def _z(x):
+        return (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-9)
+
+    feat = np.vstack([_z(mfcc), _z(chroma) * 1.5])
+
+    # Aggregate to ~1s frames: song boundaries are a coarse structure and
+    # note-level detail only adds noise.
+    step = max(1, int(round(res * fps)))
+    n = (feat.shape[1] // step) * step
+    if n < step * 4:
+        return []
+    coarse = feat[:, :n].reshape(feat.shape[0], -1, step).mean(axis=2)
+    unit = coarse / (np.linalg.norm(coarse, axis=0, keepdims=True) + 1e-9)
+
+    sim = unit.T @ unit
+    L = int(half / res)
+    if sim.shape[0] < 2 * L + 2:
+        return []
+
+    taper = np.outer(np.hanning(2 * L), np.hanning(2 * L))
+    kern = np.kron(np.array([[1.0, -1.0], [-1.0, 1.0]]), np.ones((L, L))) * taper
+    kern /= np.abs(kern).sum()
+
+    nov = np.zeros(sim.shape[0])
+    for i in range(L, sim.shape[0] - L):
+        nov[i] = (sim[i - L:i + L, i - L:i + L] * kern).sum()
+    nov = np.maximum(nov, 0)
+    if nov.max() <= 0:
+        return []
+    nov /= nov.max()
+
+    peaks, _ = find_peaks(nov, prominence=prom, distance=int(min_gap / res))
+    if not len(peaks):
+        return []
+
+    # Validate: compare the flanking windows against the track's own
+    # typical window-to-window variation.
+    def _vec(a, b):
+        i, j = int(a * fps), int(b * fps)
+        i, j = max(0, i), min(feat.shape[1], j)
+        if j - i < 10:
+            return None
+        v = feat[:, i:j].mean(axis=1)
+        return v / (np.linalg.norm(v) + 1e-9)
+
+    total = feat.shape[1] / fps
+    base = []
+    for t in np.arange(ctx, max(ctx, total - 2 * ctx), ctx):
+        u, v = _vec(t - ctx, t), _vec(t, t + ctx)
+        if u is not None and v is not None:
+            base.append(1 - float(u @ v))
+    baseline = float(np.median(base)) if base else 0.0
+
+    kept = []
+    for p in peaks:
+        t = p * res
+        u, v = _vec(t - ctx, t), _vec(t, t + ctx)
+        if u is None or v is None:
+            continue
+        d = 1 - float(u @ v)
+        if baseline <= 0 or d / baseline >= ratio:
+            kept.append(t)
+    return kept
+
+
 def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
-                win=1.0, hop_sec=1.0, music_only=False):
+                win=1.0, hop_sec=1.0, music_only=False, subdivide=True):
     """Split a concert recording into individual songs.
 
     Songs at a live show are separated by applause and talking, not by
@@ -651,12 +740,37 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
     base = os.path.splitext(os.path.basename(audio_path))[0]
     pad_n = int(pad * osr)
 
-    n_song = n_talk = 0
+    # Consecutive songs often run together with no talking between them,
+    # so subdivide each musical passage where the melody or language
+    # changes.
+    pieces = []
     for a, b, musical in segments:
         if (b - a) / sr < min_song:
             continue
         if not musical and music_only:
             continue
+        if not musical or not subdivide:
+            pieces.append((a, b, musical))
+            continue
+
+        lo, hi = int(a * scale), int(b * scale)
+        mono = orig[:, lo:hi].mean(axis=0)
+        an_sr = 22050
+        mono = librosa.resample(mono, orig_sr=osr, target_sr=an_sr)
+        cps = _musical_change_points(mono, an_sr)
+        cps = [c for c in cps if c > min_song and (b - a) / sr - c > min_song]
+        if cps:
+            print(f"  subdividing {(b - a) / sr:.0f}s passage at "
+                  + ", ".join(f"{c / 60:.1f}min" for c in cps))
+        prev = a
+        for c in cps:
+            cut = a + c * sr          # back to PANNs-rate index space
+            pieces.append((prev, cut, True))
+            prev = cut
+        pieces.append((prev, b, True))
+
+    n_song = n_talk = 0
+    for a, b, musical in pieces:
         s = max(0, int(a * scale) - pad_n)
         e = min(orig.shape[1], int(b * scale) + pad_n)
         seg = orig[:, s:e]
@@ -790,6 +904,8 @@ def main():
     parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
     parser.add_argument("--split-songs", action="store_true",
                         help="Split a concert into individual songs using music vs. applause/speech boundaries")
+    parser.add_argument("--no-subdivide", action="store_true",
+                        help="Do not subdivide a musical passage where the melody or language changes")
     parser.add_argument("--music-only", action="store_true",
                         help="Write only musical passages, skipping the spoken sections between them")
     parser.add_argument("--min-song", type=float, default=45.0,
@@ -837,7 +953,7 @@ def main():
     if args.split_songs:
         print(f"Splitting {args.input} into songs...")
         split_songs(args.input, args.out_dir, min_song=args.min_song,
-                    music_only=args.music_only)
+                    music_only=args.music_only, subdivide=not args.no_subdivide)
         return
 
     if args.split:
