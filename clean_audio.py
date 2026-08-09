@@ -201,6 +201,30 @@ def detect_events_panns(audio_path, threshold=0.3, win=1.0, hop_sec=0.5,
     return merged
 
 
+def _write_audio(path, data, sr):
+    """Write audio losslessly by default.
+
+    The repair touches well under 1% of a recording, so re-encoding the
+    whole thing to MP3 would impose generation loss on everything to fix
+    almost nothing -- and splitting afterwards would encode a second
+    time. FLAC (24-bit) keeps the untouched audio bit-exact. An explicit
+    .mp3/.ogg path is still honoured for final delivery.
+    """
+    arr = data.T if getattr(data, "ndim", 1) > 1 else data
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".mp3", ".ogg", ".m4a"):
+        print(f"  note: writing lossy {ext} -- use .flac to avoid generation loss")
+        sf.write(path, arr, sr)
+    else:
+        sf.write(path, arr, sr, subtype="PCM_24")
+
+
+def _lossless_path(path):
+    """Redirect a lossy output path to FLAC, preserving the stem."""
+    stem, ext = os.path.splitext(path)
+    return stem + ".flac" if ext.lower() in (".mp3", ".ogg", ".m4a") else path
+
+
 def save_events_csv(events, path):
     """Save detected events to a CSV file."""
     with open(path, "w", newline="") as f:
@@ -264,7 +288,7 @@ def remove_events(audio_path, output_path, events, fade_ms=50):
     if cleaned.shape[0] == 1:
         cleaned = cleaned[0]
 
-    sf.write(output_path, cleaned.T if cleaned.ndim > 1 else cleaned, sr)
+    _write_audio(output_path, cleaned, sr)
 
     original_dur = y.shape[1] / sr
     cleaned_dur = cleaned.shape[-1] / sr
@@ -436,7 +460,7 @@ def inpaint_events(audio_path, output_path, events, fade_ms=30):
               f"(from {ev_s:.2f}-{ev_e:.2f})")
 
     out = repaired[0] if repaired.shape[0] == 1 else repaired
-    sf.write(output_path, out.T if out.ndim > 1 else out, sr)
+    _write_audio(output_path, out, sr)
     total = sum(e - s for s, e in events)
     print(f"Inpainted {len(events)} events ({total:.1f}s) -- level and duration preserved.")
 
@@ -531,7 +555,7 @@ def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
             print(f"  Repaired event {i:03d}: {s_sec:.2f}s - {e_sec:.2f}s")
 
     out = repaired[0] if repaired.shape[0] == 1 else repaired
-    sf.write(output_path, out.T if out.ndim > 1 else out, sr)
+    _write_audio(output_path, out, sr)
     total = sum(e - s for s, e in events)
     print(f"Repaired {len(events)} events ({total:.1f}s) in place -- duration unchanged.")
 
@@ -631,8 +655,8 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
         if seg.shape[0] == 1:
             seg = seg[0]
         count += 1
-        path = os.path.join(out_dir, f"{base}_song_{count:02d}.mp3")
-        sf.write(path, seg.T if seg.ndim > 1 else seg, osr)
+        path = os.path.join(out_dir, f"{base}_song_{count:02d}.flac")
+        _write_audio(path, seg, osr)
         print(f"  Song {count:02d}: {s / osr:8.1f}s - {e / osr:8.1f}s  ({(e - s) / osr:6.1f}s)  -> {path}")
 
     if count == 0:
@@ -732,8 +756,8 @@ def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
         if track.shape[0] == 1:
             track = track[0]
         count += 1
-        out_path = os.path.join(out_dir, f"{base}_track_{count:02d}.mp3")
-        sf.write(out_path, track.T if track.ndim > 1 else track, sr)
+        out_path = os.path.join(out_dir, f"{base}_track_{count:02d}.flac")
+        _write_audio(out_path, track, sr)
         print(f"  Track {count:02d}: {s / sr:8.1f}s - {e / sr:8.1f}s  ({(e - s) / sr:6.1f}s)  -> {out_path}")
 
     if count == 0:
@@ -770,6 +794,9 @@ def main():
     parser.add_argument("--detector", choices=["panns", "spectral"], default="panns",
                         help="Event detector: 'panns' recognises cough/throat-clearing/sneeze via a pretrained "
                              "AudioSet model; 'spectral' uses the loudness/noisiness heuristic (default: panns)")
+    parser.add_argument("--keep-lossy", action="store_true",
+                        help="Honour a .mp3/.ogg output path instead of redirecting to FLAC. "
+                             "Only for final delivery -- it re-encodes the whole recording")
     parser.add_argument("--threshold", type=float, default=0.3,
                         help="PANNs class probability needed to flag an event (default: 0.3; lower finds more). "
                              "True coughs score ~0.5-0.7; music sits below ~0.1")
@@ -832,6 +859,12 @@ def main():
         for i, (s, e) in enumerate(events):
             print(f"  Event {i:03d}: {s:.2f}s - {e:.2f}s (duration: {e - s:.2f}s)")
         return
+
+    out_path = args.output if args.keep_lossy else _lossless_path(args.output)
+    if out_path != args.output:
+        print(f"Writing lossless FLAC instead of {os.path.splitext(args.output)[1]} "
+              f"(use --keep-lossy to override)")
+    args.output = out_path
 
     print(f"Cleaning audio -> {args.output} (method: {args.method})")
     if args.method == "inpaint":
