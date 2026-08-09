@@ -1,8 +1,8 @@
 # audio-cleanup
 
-Clean up long audio recordings: detect and remove unwanted audio events
-(coughs and other transient noises), and split a single multi-hour
-recording into individual tracks.
+Clean up long recordings: remove coughs and similar transient noises
+without damaging the material underneath, and split a multi-hour file
+into individual songs.
 
 Everything lives in one script: [`clean_audio.py`](clean_audio.py).
 
@@ -14,135 +14,111 @@ Everything lives in one script: [`clean_audio.py`](clean_audio.py).
 pip install -r requirements.txt
 ```
 
-`librosa`/`numpy`/`soundfile` cover detection, cutting, and splitting.
-`demucs`/`torch` are needed for the default stem-swap cleaning method.
+`librosa`/`numpy`/`soundfile` are the core. `panns-inference`/`torch`
+power the default detector and the song splitter; the model checkpoint
+(~320MB) downloads automatically on first use. `demucs` is only needed
+for the optional `--method stem`.
 
 ## Usage
 
-### Detect and clean events (one step)
+### Clean a recording
 
 ```bash
-python clean_audio.py input.mp3 output.mp3
+python clean_audio.py raw/recording.mp3 output/cleaned.flac
 ```
 
-By default events are **repaired, not cut**: Demucs separates each event
-window into vocals vs. accompaniment, and the event range is replaced
-with the accompaniment-only audio. The music plays through uninterrupted,
-the recording's duration is unchanged, and audio outside the event
-windows is untouched. Use `--method cut` to splice events out instead
-(shorter output, loses the music under each event).
+Detects coughs / throat clearing / sneezes and repairs them in place.
+Duration is unchanged and audio outside the detected events is left
+bit-exact.
 
 ### Detect only (review before cleaning)
 
 ```bash
-python clean_audio.py input.mp3 --detect-only --events-csv events.csv
+python clean_audio.py raw/recording.mp3 --detect-only --events-csv events.csv
 ```
 
-Prints each detected event with timestamps and saves them to a CSV
-(`start_seconds,end_seconds` per line). Review/edit the CSV, then clean:
+Writes `start_seconds,end_seconds` per line. Review or edit the CSV,
+then clean using it:
 
 ```bash
-python clean_audio.py input.mp3 output.mp3 --use-existing-events events.csv
+python clean_audio.py raw/recording.mp3 output/cleaned.flac --use-existing-events events.csv
 ```
 
-### Tune detection sensitivity
-
-Detection has three presets — `strict` (default), `medium`, and `loose`.
-Looser settings flag more events (at the risk of more false positives).
-
-```bash
-python clean_audio.py input.mp3 output.mp3 --sensitivity medium
-```
-
-To compare all levels in one run, use multi-pass. It detects at every
-sensitivity level and writes one events CSV per level — no audio is
-modified:
-
-```bash
-python clean_audio.py input.mp3 --multi-pass
-#   strict:  24 events,   92.3s flagged -> input_events_strict.csv
-#   medium:  31 events,  118.7s flagged -> input_events_medium.csv
-#   loose :  40 events,  151.2s flagged -> input_events_loose.csv
-```
-
-Pick the level whose CSV looks right, then clean with it via
-`--use-existing-events`.
-
-### Split a recording into individual songs
+### Split into individual songs
 
 Live recordings separate songs with applause and talking rather than
-silence, so this scores each second for music vs. applause/speech with
-the AudioSet tagger, smooths over a 20s window, and cuts at sustained
-music↔non-music transitions.
+silence, so this scores each second for music vs. applause/speech,
+smooths over 20s, and cuts at sustained music↔non-music transitions.
 
 ```bash
-python clean_audio.py raw/concert.mp3 --split-songs --out-dir output/songs
+python clean_audio.py output/cleaned.flac --split-songs --out-dir output/songs
 ```
 
-Use `--min-song` (default 45s) to discard fragments. If it over-splits,
-raise it; if it merges two songs, lower it.
+`--min-song` (default 45s) discards fragments. Raise it if it
+over-splits; lower it if two songs get merged.
 
-### Split a long recording into tracks (silence-based)
-
-Splits at sustained quiet gaps. The gaps don't need to be true silence —
-brief loud blips (a cough, a chair scrape) inside a gap are bridged over.
-
-```bash
-python clean_audio.py recording.mp3 --split --out-dir tracks
-```
-
-Tuning flags:
+## Key options
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--silence-db` | 35 | How many dB below the loud content counts as "quiet". Lower = stricter (gap must be quieter). |
-| `--min-silence` | 3.0 | Minimum sustained quiet (seconds) to mark a track boundary. |
-| `--min-track` | 20 | Drop segments shorter than this (seconds). |
-| `--cough-tol` | 1.0 | Bridge over loud blips up to this long (seconds) inside a quiet gap. |
-| `--out-dir` | `tracks` | Output directory. |
+| `--detector` | `panns` | `panns` recognises actual sound classes; `spectral` is the old loudness heuristic (kept as a fast fallback, misses most events) |
+| `--threshold` | `0.3` | Class probability to flag an event. Real coughs score 0.5–0.7, music sits below 0.1 |
+| `--method` | `inpaint` | `inpaint` removes only the noise energy; `stem` swaps in Demucs accompaniment; `cut` splices the range out |
+| `--keep-lossy` | off | Honour an `.mp3` output path instead of redirecting to FLAC |
 
-If it over-splits (cuts inside tracks), lower `--silence-db` or raise
-`--min-silence`. If it misses boundaries because of noises in the gaps,
-raise `--cough-tol`.
+Detection is deliberately conservative. Because a false positive still
+costs a repair, prefer raising `--threshold` over lowering it unless
+events are being missed.
 
 ## How it works
 
-**Event detection** computes frame-level RMS energy, spectral flatness,
-zero-crossing rate, and spectral rolloff, then flags frames where all
-four exceed percentile thresholds (the sensitivity preset). Flagged runs
-of 0.4–10s become events, padded slightly and merged when close together.
+**Detection** runs PANNs (an AudioSet-pretrained CNN14 tagger) over 1s
+windows at 0.5s hop and flags windows where Cough / Throat clearing /
+Sneeze exceeds the threshold. Hysteresis extends each event while
+neighbouring windows stay above a third of the threshold, so events
+aren't truncated mid-cough.
 
-**Cleaning** has three methods. `inpaint` (default): only the
-time-frequency energy exceeding what the surrounding music reaches is
-attenuated, bounded by a gain floor, so music and voice continuing
-through the event keep their level and there is no audible dropout.
-`stem`: each event window plus a
-few seconds of context is separated by Demucs (htdemucs, two-stem); the
-event range is patched with the accompaniment-only stem, crossfaded at
-the edges, so no music is lost and timing is preserved. `cut`: the
-flagged ranges are spliced out with short crossfades.
+**Repair** (`inpaint`) first narrows the ~1–4s flagged window down to
+the actual transient using a 10ms energy envelope — a cough is ~0.4s, so
+repairing the whole window would needlessly process good audio. It then
+takes a median reference spectrum from clean guard regions either side
+(excluding any neighbouring event), interpolates that reference across
+the event so evolving music is tracked, and attenuates each
+time-frequency bin down to the expected level. Phase is preserved and
+one shared gain mask is applied to both channels, so the stereo image
+doesn't shift.
 
-**Track splitting** measures frame loudness relative to the recording's
-loud content (95th percentile), finds sustained quiet runs, bridges short
-loud blips inside them, and cuts at each gap's midpoint.
+Median rather than max matters: a max-based reference is set by any
+transient in the guard region and leaves the cough untouched. There is
+deliberately no gain floor — a cough sits 25–35dB above quiet ambience,
+so a floor would only make it quieter rather than remove it.
+
+**Song splitting** scores Music against Applause/Speech/Cheering, smooths
+both over 20s, drops runs too short to be a real passage, merges
+same-label neighbours, and cuts at the remaining transitions.
+
+**Output is 24-bit FLAC.** The repair touches well under 1% of a
+recording, so encoding the result to MP3 would impose generation loss on
+all of it — and splitting afterwards would encode a second time. An
+`.mp3` output path is redirected to `.flac` unless `--keep-lossy` is
+given.
 
 ## Folder layout
 
 ```
 raw/        original recordings (gitignored)
-events/     detected event CSVs + review clips (gitignored)
-output/     cleaned audio and split tracks (gitignored)
+events/     detected event CSVs (gitignored)
+output/     cleaned audio and split songs (gitignored)
 ```
 
-## Typical workflow for a long recording
+## Typical workflow
 
 ```bash
-# 1. Compare detection sensitivities
-python clean_audio.py raw/recording.mp3 --multi-pass
+# 1. Clean each chunk (writes lossless FLAC + an event CSV to review)
+python clean_audio.py raw/chunk_0.mp3 output/clean/chunk_0_clean.flac \
+    --events-csv events/chunk_0.csv
 
-# 2. Clean with the level you picked
-python clean_audio.py raw/recording.mp3 output/cleaned.mp3 --use-existing-events recording_events_strict.csv
-
-# 3. Split the cleaned file into tracks
-python clean_audio.py output/cleaned.mp3 --split --out-dir output/tracks
+# 2. Split the cleaned audio into songs
+python clean_audio.py output/clean/chunk_0_clean.flac \
+    --split-songs --out-dir output/songs/chunk_0
 ```

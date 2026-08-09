@@ -3,7 +3,9 @@ librosa>=0.10
 numpy
 soundfile
 
-# Stem-swap repair (--method stem, the default & highest quality)
-demucs>=4.0
-torch>=2.0
+# Default detector (--detector panns) and song splitting
 panns-inference
+torch>=2.0
+
+# Optional: --method stem
+demucs>=4.0
