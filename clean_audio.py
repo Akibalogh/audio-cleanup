@@ -436,6 +436,101 @@ def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
     print(f"Repaired {len(events)} events ({total:.1f}s) in place -- duration unchanged.")
 
 
+def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
+                win=1.0, hop_sec=1.0):
+    """Split a concert recording into individual songs.
+
+    Songs at a live show are separated by applause and talking, not by
+    silence, so the silence-based splitter misses those boundaries. This
+    scores each second of the recording for Music vs. Applause/Speech
+    using the same AudioSet tagger as detection, then cuts where music
+    gives way to a sustained non-music stretch.
+
+    min_song - discard segments shorter than this (s)
+    pad      - keep this much audio either side of each boundary (s)
+    """
+    _ensure_panns_data()
+    from panns_inference import AudioTagging
+    from panns_inference.config import labels
+
+    music_idx = [labels.index(c) for c in ["Music"] if c in labels]
+    break_idx = [labels.index(c) for c in
+                 ["Applause", "Speech", "Cheering", "Clapping",
+                  "Hubbub, speech noise, speech babble"] if c in labels]
+
+    sr = 32000
+    y, _ = librosa.load(audio_path, sr=sr, mono=True)
+    at = AudioTagging(checkpoint_path=None, device="cpu")
+
+    win_n, hop_n = int(win * sr), int(hop_sec * sr)
+    starts = list(range(0, max(1, len(y) - win_n + 1), hop_n))
+
+    music, brk = [], []
+    batch = 32
+    for i in range(0, len(starts), batch):
+        block = np.stack([y[s:s + win_n] for s in starts[i:i + batch]])
+        out = at.inference(block)[0]
+        music.extend(out[:, music_idx].max(axis=1).tolist())
+        brk.extend(out[:, break_idx].max(axis=1).tolist())
+        if (i // batch) % 20 == 0:
+            print(f"  scanning... {100 * min(i + batch, len(starts)) / len(starts):.0f}%", flush=True)
+
+    music, brk = np.array(music), np.array(brk)
+
+    # Tags flicker second to second, so smooth over a long window: what
+    # matters is whether a whole passage is musical, not any one second.
+    smooth_n = max(3, int(round(20.0 / hop_sec)))
+    kern = np.ones(smooth_n) / smooth_n
+    music_s = np.convolve(music, kern, mode="same")
+    brk_s = np.convolve(brk, kern, mode="same")
+
+    is_music = music_s > brk_s
+
+    # Boundaries are sustained transitions between musical and
+    # non-musical passages -- short excursions are ignored.
+    min_run = max(1, int(round(min_song * 0.5 / hop_sec)))
+    runs = []
+    run_start = 0
+    for k in range(1, len(is_music)):
+        if is_music[k] != is_music[k - 1]:
+            runs.append((run_start, k, is_music[k - 1]))
+            run_start = k
+    runs.append((run_start, len(is_music), is_music[-1]))
+
+    # Merge out runs too short to be a real passage.
+    stable = [r for r in runs if r[1] - r[0] >= min_run]
+    boundaries = [r[0] for r in stable[1:]]
+
+    cuts = [0] + [starts[b] for b in boundaries] + [len(y)]
+    orig, osr = librosa.load(audio_path, sr=None, mono=False)
+    if orig.ndim == 1:
+        orig = orig[np.newaxis, :]
+    scale = osr / sr  # map PANNs-rate indices back to the original rate
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    pad_n = int(pad * osr)
+
+    count = 0
+    for a, b in zip(cuts, cuts[1:]):
+        if (b - a) / sr < min_song:
+            continue
+        s = max(0, int(a * scale) - pad_n)
+        e = min(orig.shape[1], int(b * scale) + pad_n)
+        seg = orig[:, s:e]
+        if seg.shape[0] == 1:
+            seg = seg[0]
+        count += 1
+        path = os.path.join(out_dir, f"{base}_song_{count:02d}.mp3")
+        sf.write(path, seg.T if seg.ndim > 1 else seg, osr)
+        print(f"  Song {count:02d}: {s / osr:8.1f}s - {e / osr:8.1f}s  ({(e - s) / osr:6.1f}s)  -> {path}")
+
+    if count == 0:
+        print("No songs found. Try lowering --min-song.")
+    else:
+        print(f"Found {len(boundaries)} boundaries -> wrote {count} songs to {out_dir}/")
+
+
 def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
                  min_track=20.0, pad=0.5, cough_tol=1.0):
     """Split a long recording into individual tracks at quiet gaps.
@@ -545,6 +640,10 @@ def main():
     parser.add_argument("--detect-only", action="store_true", help="Only detect events, don't clean audio")
     parser.add_argument("--use-existing-events", help="Use events from an existing CSV instead of detecting")
     parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
+    parser.add_argument("--split-songs", action="store_true",
+                        help="Split a concert into individual songs using music vs. applause/speech boundaries")
+    parser.add_argument("--min-song", type=float, default=45.0,
+                        help="Drop songs shorter than this many seconds (default: 45)")
     parser.add_argument("--out-dir", default="tracks", help="Output directory for --split (default: tracks)")
     parser.add_argument("--silence-db", type=float, default=35, help="dB below loud content treated as quiet (default: 35)")
     parser.add_argument("--min-silence", type=float, default=3.0, help="Min sustained quiet in seconds marking a track boundary (default: 3.0)")
@@ -579,6 +678,11 @@ def main():
         print("\nCompare the CSVs (or spot-check clips), then clean with the level you like:")
         best = results["strict"][2]
         print(f"  python clean_audio.py '{args.input}' output.mp3 --use-existing-events {best}")
+        return
+
+    if args.split_songs:
+        print(f"Splitting {args.input} into songs...")
+        split_songs(args.input, args.out_dir, min_song=args.min_song)
         return
 
     if args.split:

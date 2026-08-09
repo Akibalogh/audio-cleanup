@@ -68,7 +68,21 @@ python clean_audio.py input.mp3 --multi-pass
 Pick the level whose CSV looks right, then clean with it via
 `--use-existing-events`.
 
-### Split a long recording into tracks
+### Split a recording into individual songs
+
+Live recordings separate songs with applause and talking rather than
+silence, so this scores each second for music vs. applause/speech with
+the AudioSet tagger, smooths over a 20s window, and cuts at sustained
+music↔non-music transitions.
+
+```bash
+python clean_audio.py raw/concert.mp3 --split-songs --out-dir output/songs
+```
+
+Use `--min-song` (default 45s) to discard fragments. If it over-splits,
+raise it; if it merges two songs, lower it.
+
+### Split a long recording into tracks (silence-based)
 
 Splits at sustained quiet gaps. The gaps don't need to be true silence —
 brief loud blips (a cough, a chair scrape) inside a gap are bridged over.
@@ -98,7 +112,11 @@ zero-crossing rate, and spectral rolloff, then flags frames where all
 four exceed percentile thresholds (the sensitivity preset). Flagged runs
 of 0.4–10s become events, padded slightly and merged when close together.
 
-**Cleaning** has two methods. `stem` (default): each event window plus a
+**Cleaning** has three methods. `inpaint` (default): only the
+time-frequency energy exceeding what the surrounding music reaches is
+attenuated, bounded by a gain floor, so music and voice continuing
+through the event keep their level and there is no audible dropout.
+`stem`: each event window plus a
 few seconds of context is separated by Demucs (htdemucs, two-stem); the
 event range is patched with the accompaniment-only stem, crossfaded at
 the edges, so no music is lost and timing is preserved. `cut`: the
