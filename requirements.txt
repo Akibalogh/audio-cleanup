@@ -9,3 +9,6 @@ torch>=2.0
 
 # Optional: --method stem
 demucs>=4.0
+
+# Song titling from lyrics (--title-songs); also needs ffmpeg on PATH
+openai-whisper

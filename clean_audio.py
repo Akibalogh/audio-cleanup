@@ -10,9 +10,13 @@ Usage:
 
 import argparse
 import csv
+import glob
+import json
 import os
+import re
 import sys
 import tempfile
+import unicodedata
 
 import librosa
 import numpy as np
@@ -793,6 +797,106 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
         print(f"Wrote {n_song} songs and {n_talk} spoken passages to {out_dir}/")
 
 
+# Languages worth trusting a transcript from. A detection outside this
+# set usually means the singing is non-lexical (vocables), not that the
+# recording is in an exotic language.
+TITLE_LANGS = {"en", "es", "pt", "hu"}
+
+_JUNK_WORD = re.compile(r"^(bleh|arrgh|uh+|ah+|oh+|hmm+|mm+|la|na|ha)$", re.I)
+
+
+def _clean_title(text, max_words=6):
+    text = re.sub(r"[^\w\s'\-]", " ", text, flags=re.UNICODE)
+    words = [w for w in text.split() if w]
+    if not words:
+        return None
+    title = " ".join(words[:max_words]).strip()
+    return title[:1].upper() + title[1:] if title else None
+
+
+def _titleable(text, lang):
+    """Is this transcript real lyrics, or noise the model invented?"""
+    words = [w.lower() for w in re.findall(r"[^\W\d_]+", text, re.UNICODE)]
+    if len(words) < 8:
+        return False
+    if len(set(words)) / len(words) < 0.25:        # same token over and over
+        return False
+    if sum(bool(_JUNK_WORD.match(w)) for w in words) > 0.4 * len(words):
+        return False
+    return lang in TITLE_LANGS
+
+
+def _safe_filename(name):
+    return re.sub(r'[/\\:*?"<>|]', "-", unicodedata.normalize("NFC", name)).strip()
+
+
+def title_songs(song_dir, mp3_dir, model="medium", offset=15.0, listen=90.0,
+                bitrate_q=0):
+    """Name songs from their lyrics and export numbered MP3s.
+
+    Transcribes the opening of each song -- chants are conventionally
+    named for their first line -- detects the language, and uses the
+    result as a title. Songs whose transcript is not credible (too few
+    words, one token repeated, or a language outside TITLE_LANGS, which
+    is what non-lexical vocables produce) are left untitled for manual
+    naming rather than given an invented name.
+
+    Files are numbered chronologically across the whole recording so they
+    sort correctly regardless of title.
+    """
+    import subprocess
+    import tempfile
+
+    import whisper
+
+    files = []
+    for sub in sorted(os.listdir(song_dir)):
+        d = os.path.join(song_dir, sub)
+        if os.path.isdir(d):
+            files += sorted(glob.glob(os.path.join(d, "*_song_*.flac")))
+    if not files:
+        files = sorted(glob.glob(os.path.join(song_dir, "*_song_*.flac")))
+    if not files:
+        print(f"No songs found under {song_dir}")
+        return
+
+    os.makedirs(mp3_dir, exist_ok=True)
+    print(f"Naming {len(files)} songs with the '{model}' model...")
+    net = whisper.load_model(model)
+
+    manifest = []
+    for i, path in enumerate(files, 1):
+        y, sr = librosa.load(path, sr=16000, mono=True, offset=offset, duration=listen)
+        tmp = tempfile.mktemp(suffix=".wav")
+        sf.write(tmp, y, sr)
+        try:
+            res = net.transcribe(tmp)
+        finally:
+            os.remove(tmp)
+
+        text = " ".join(s["text"].strip() for s in res.get("segments", []))
+        lang = res.get("language", "")
+        title = _clean_title(text) if _titleable(text, lang) else None
+
+        stem = f"{i:02d} - {_safe_filename(title)}" if title else f"{i:02d} - untitled"
+        out = os.path.join(mp3_dir, stem + ".mp3")
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", path,
+               "-codec:a", "libmp3lame", "-q:a", str(bitrate_q),
+               "-metadata", f"track={i}",
+               "-metadata", f"title={title or os.path.basename(path)[:-5]}",
+               "-metadata", "album=Recording", out]
+        subprocess.run(cmd, check=True)
+
+        manifest.append({"n": i, "source": path, "language": lang,
+                         "title": title, "mp3": out, "transcript": text[:400]})
+        print(f"  {i:02d}  {lang or '--':3}  {title or '(untitled -- name manually)'}", flush=True)
+
+    with open(os.path.join(mp3_dir, "titles.json"), "w") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=1)
+    named = sum(1 for m in manifest if m["title"])
+    print(f"Named {named} of {len(manifest)}; {len(manifest) - named} left untitled -> {mp3_dir}/")
+
+
 def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
                  min_track=20.0, pad=0.5, cough_tol=1.0):
     """Split a long recording into individual tracks at quiet gaps.
@@ -896,7 +1000,7 @@ def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
 
 def main():
     parser = argparse.ArgumentParser(description="Detect and remove unwanted audio events")
-    parser.add_argument("input", help="Input audio file")
+    parser.add_argument("input", nargs="?", help="Input audio file")
     parser.add_argument("output", nargs="?", help="Output audio file (required unless --detect-only)")
     parser.add_argument("--events-csv", help="Path to save/load events CSV")
     parser.add_argument("--detect-only", action="store_true", help="Only detect events, don't clean audio")
@@ -904,6 +1008,12 @@ def main():
     parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
     parser.add_argument("--split-songs", action="store_true",
                         help="Split a concert into individual songs using music vs. applause/speech boundaries")
+    parser.add_argument("--title-songs", metavar="SONG_DIR",
+                        help="Transcribe songs under SONG_DIR and export numbered, titled MP3s")
+    parser.add_argument("--mp3-dir", default="output/mp3_named",
+                        help="Where --title-songs writes MP3s (default: output/mp3_named)")
+    parser.add_argument("--whisper-model", default="medium",
+                        help="Whisper model for --title-songs (default: medium)")
     parser.add_argument("--no-subdivide", action="store_true",
                         help="Do not subdivide a musical passage where the melody or language changes")
     parser.add_argument("--music-only", action="store_true",
@@ -948,6 +1058,10 @@ def main():
         print("\nCompare the CSVs (or spot-check clips), then clean with the level you like:")
         best = results["strict"][2]
         print(f"  python clean_audio.py '{args.input}' output.mp3 --use-existing-events {best}")
+        return
+
+    if args.title_songs:
+        title_songs(args.title_songs, args.mp3_dir, model=args.whisper_model)
         return
 
     if args.split_songs:
