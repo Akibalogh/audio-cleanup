@@ -57,31 +57,6 @@ python clean_audio.py output/cleaned.flac --split-songs --out-dir output/songs
 `--min-song` (default 45s) discards fragments. Raise it if it
 over-splits; lower it if two songs get merged.
 
-### Name songs from their lyrics
-
-```bash
-python clean_audio.py --title-songs output/songs --mp3-dir output/mp3_named
-```
-
-Transcribes the opening of each song, detects the language (English,
-Spanish, Portuguese, Hungarian), and names the file after the first
-line -- the usual convention for chants. Output is numbered
-chronologically across the whole recording so it sorts correctly
-regardless of title:
-
-```
-01 - Medicina Del Viento.mp3
-02 - untitled.mp3
-```
-
-Songs whose transcript is not credible are left `untitled` for manual
-naming rather than given an invented one. That covers non-lexical
-vocables (the model reports an implausible language and produces
-syllables), instrumental passages, and near-silence. A `titles.json`
-alongside the MP3s records each transcript and detected language.
-
-Requires `ffmpeg` on PATH.
-
 ## Key options
 
 | Flag | Default | Meaning |
@@ -91,7 +66,6 @@ Requires `ffmpeg` on PATH.
 | `--method` | `inpaint` | `inpaint` removes only the noise energy; `stem` swaps in Demucs accompaniment; `cut` splices the range out |
 | `--keep-lossy` | off | Honour an `.mp3` output path instead of redirecting to FLAC |
 | `--no-subdivide` | off | Keep a musical passage whole instead of splitting where the melody or language changes |
-| `--whisper-model` | `medium` | Model for `--title-songs`. `small` is faster but weak on code-switching |
 
 Detection is deliberately conservative. Because a false positive still
 costs a repair, prefer raising `--threshold` over lowering it unless
