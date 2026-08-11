@@ -14,10 +14,9 @@ Everything lives in one script: [`clean_audio.py`](clean_audio.py).
 pip install -r requirements.txt
 ```
 
-`librosa`/`numpy`/`soundfile` are the core. `panns-inference`/`torch`
-power the default detector and the song splitter; the model checkpoint
-(~320MB) downloads automatically on first use. `demucs` is only needed
-for the optional `--method stem`.
+`librosa`/`numpy`/`scipy`/`soundfile` are the core. `panns-inference`/`torch`
+power detection and song splitting; the model checkpoint (~320MB)
+downloads automatically on first use.
 
 ## Usage
 
@@ -61,9 +60,8 @@ over-splits; lower it if two songs get merged.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--detector` | `panns` | `panns` recognises actual sound classes; `spectral` is the old loudness heuristic (kept as a fast fallback, misses most events) |
 | `--threshold` | `0.3` | Class probability to flag an event. Real coughs score 0.5–0.7, music sits below 0.1 |
-| `--method` | `inpaint` | `inpaint` removes only the noise energy; `stem` swaps in Demucs accompaniment; `cut` splices the range out |
+| `--method` | `inpaint` | `inpaint` removes only the noise energy; `cut` splices the range out |
 | `--keep-lossy` | off | Honour an `.mp3` output path instead of redirecting to FLAC |
 | `--no-subdivide` | off | Keep a musical passage whole instead of splitting where the melody or language changes |
 

@@ -21,65 +21,6 @@ import numpy as np
 import soundfile as sf
 
 
-# Detection sensitivity presets: percentile thresholds for each feature.
-# Lower percentiles flag more frames -> more (and longer) events detected.
-SENSITIVITY_PRESETS = {
-    "strict": {"rms": 86, "flat": 72, "zcr": 70, "roll": 62},   # current defaults
-    "medium": {"rms": 82, "flat": 68, "zcr": 66, "roll": 58},
-    "loose":  {"rms": 78, "flat": 64, "zcr": 62, "roll": 54},
-}
-
-
-def detect_events(audio_path, sr=16000, sensitivity="strict"):
-    """Detect unwanted audio events using spectral analysis.
-
-    sensitivity is one of SENSITIVITY_PRESETS ("strict", "medium", "loose").
-    Looser settings flag more events.
-    """
-    thr = SENSITIVITY_PRESETS[sensitivity]
-
-    y, sr = librosa.load(audio_path, sr=sr, mono=True)
-
-    frame = 4096
-    hop = 512
-
-    rms = librosa.feature.rms(y=y, frame_length=frame, hop_length=hop)[0]
-    flat = librosa.feature.spectral_flatness(y=y, hop_length=hop)[0]
-    zcr = librosa.feature.zero_crossing_rate(y, frame_length=frame, hop_length=hop)[0]
-    roll = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop, roll_percent=0.85)[0]
-
-    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
-
-    score = (
-        (rms_db > np.percentile(rms_db, thr["rms"]))
-        & (flat > np.percentile(flat, thr["flat"]))
-        & (zcr > np.percentile(zcr, thr["zcr"]))
-        & (roll > np.percentile(roll, thr["roll"]))
-    )
-
-    times = librosa.frames_to_time(np.arange(len(score)), sr=sr, hop_length=hop)
-
-    events = []
-    start = None
-    for t, active in zip(times, score):
-        if active and start is None:
-            start = t
-        elif not active and start is not None:
-            dur = t - start
-            if 0.4 <= dur <= 10:
-                events.append((max(0, start - 1.0), t + 1.5))
-            start = None
-
-    merged = []
-    for s, e in events:
-        if merged and s - merged[-1][1] < 2.0:
-            merged[-1] = (merged[-1][0], e)
-        else:
-            merged.append((s, e))
-
-    return merged
-
-
 # AudioSet classes that represent unwanted noise events.
 NOISE_CLASSES = ["Cough", "Throat clearing", "Sneeze"]
 
@@ -467,190 +408,6 @@ def inpaint_events(audio_path, output_path, events, fade_ms=30):
     print(f"Inpainted {len(events)} events ({total:.1f}s) -- level and duration preserved.")
 
 
-def repair_events(audio_path, output_path, events, ctx=3.0, fade_ms=250):
-    """Repair detected events by stem-swapping instead of cutting.
-
-    For each event window, Demucs separates a padded snippet into
-    vocals vs. accompaniment; the event range is then replaced with the
-    accompaniment-only audio (music keeps playing, the cough/noise is
-    gone). The rest of the recording is untouched, so there is no
-    overall fidelity loss and no timing shift.
-
-    ctx     - extra context (s) around each event given to Demucs
-              (separation quality is poor at snippet edges)
-    fade_ms - crossfade between original and repaired audio at the
-              event boundaries
-    """
-    import shutil
-    import subprocess
-
-    y, sr = librosa.load(audio_path, sr=None, mono=False)
-    if y.ndim == 1:
-        y = y[np.newaxis, :]
-    n_samples = y.shape[1]
-
-    events = sorted(events)
-
-    with tempfile.TemporaryDirectory(prefix="stemswap_") as tmp:
-        # 1. Write a padded snippet per event.
-        snippets = []
-        for i, (s_sec, e_sec) in enumerate(events):
-            ws = max(0, int((s_sec - ctx) * sr))
-            we = min(n_samples, int((e_sec + ctx) * sr))
-            snip = y[:, ws:we]
-            path = os.path.join(tmp, f"ev{i:03d}.wav")
-            sf.write(path, snip.T if snip.shape[0] > 1 else snip[0], sr)
-            snippets.append((path, ws, we))
-
-        # 2. Separate all snippets in one Demucs run (model loads once).
-        sep_dir = os.path.join(tmp, "sep")
-        cmd = [
-            sys.executable, "-m", "demucs",
-            "--two-stems", "vocals",
-            "-n", "htdemucs",
-            "-o", sep_dir,
-        ] + [p for p, _, _ in snippets]
-        print(f"Separating {len(snippets)} event snippets with Demucs...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Demucs separation failed. Is demucs installed in this venv? "
-                f"stderr:\n{result.stderr[-2000:]}"
-            )
-
-        # 3. Patch each event range with the accompaniment-only audio.
-        fade = int(sr * fade_ms / 1000)
-        repaired = y.copy()
-        for i, ((path, ws, we), (s_sec, e_sec)) in enumerate(zip(snippets, events)):
-            name = os.path.splitext(os.path.basename(path))[0]
-            music_path = os.path.join(sep_dir, "htdemucs", name, "no_vocals.wav")
-            music, _ = librosa.load(music_path, sr=sr, mono=False)
-            if music.ndim == 1:
-                music = music[np.newaxis, :]
-            if music.shape[0] != y.shape[0]:
-                music = np.tile(music.mean(axis=0, keepdims=True), (y.shape[0], 1))
-
-            # Event range within the snippet (offset by window start).
-            es = int(s_sec * sr) - ws
-            ee = int(e_sec * sr) - ws
-            es = max(0, es)
-            ee = min(music.shape[1], we - ws, ee)
-            if ee <= es:
-                continue
-
-            # Crossfade original -> music at entry, music -> original at exit,
-            # staying inside the context margins.
-            fi = min(fade, es)            # entry fade length
-            fo = min(fade, music.shape[1] - ee)  # exit fade length
-
-            patch = music[:, es - fi:ee + fo].copy()
-            dst_s = ws + es - fi
-            dst_e = ws + ee + fo
-            orig = repaired[:, dst_s:dst_e]
-
-            mix = np.ones(patch.shape[1])
-            if fi > 0:
-                mix[:fi] = np.linspace(0, 1, fi)
-            if fo > 0:
-                mix[-fo:] = np.linspace(1, 0, fo)
-            repaired[:, dst_s:dst_e] = patch * mix + orig * (1 - mix)
-            print(f"  Repaired event {i:03d}: {s_sec:.2f}s - {e_sec:.2f}s")
-
-    out = repaired[0] if repaired.shape[0] == 1 else repaired
-    _write_audio(output_path, out, sr)
-    total = sum(e - s for s, e in events)
-    print(f"Repaired {len(events)} events ({total:.1f}s) in place -- duration unchanged.")
-
-
-def _musical_change_points(y, sr, res=1.0, half=25.0, prom=0.25,
-                           min_gap=90.0, ratio=1.8, ctx=45.0):
-    """Find where one song gives way to another inside a musical passage.
-
-    Consecutive songs are often played back to back with no talking or
-    pause between them, so the Music-vs-Speech split leaves them merged.
-    A new song shows up as a change in timbre (different voice, different
-    language) and harmony (different melody, different key), which is
-    what MFCC + chroma capture.
-
-    Foote novelty over a self-similarity matrix proposes candidates; each
-    is then kept only if the audio either side really differs by more
-    than `ratio` times the track's own typical variation, which rejects
-    peaks caused by ordinary variation within one song.
-
-    Returns offsets in seconds from the start of `y`.
-    """
-    from scipy.signal import find_peaks
-
-    hop = 1024
-    fps = sr / hop
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=hop)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
-
-    def _z(x):
-        return (x - x.mean(axis=1, keepdims=True)) / (x.std(axis=1, keepdims=True) + 1e-9)
-
-    feat = np.vstack([_z(mfcc), _z(chroma) * 1.5])
-
-    # Aggregate to ~1s frames: song boundaries are a coarse structure and
-    # note-level detail only adds noise.
-    step = max(1, int(round(res * fps)))
-    n = (feat.shape[1] // step) * step
-    if n < step * 4:
-        return []
-    coarse = feat[:, :n].reshape(feat.shape[0], -1, step).mean(axis=2)
-    unit = coarse / (np.linalg.norm(coarse, axis=0, keepdims=True) + 1e-9)
-
-    sim = unit.T @ unit
-    L = int(half / res)
-    if sim.shape[0] < 2 * L + 2:
-        return []
-
-    taper = np.outer(np.hanning(2 * L), np.hanning(2 * L))
-    kern = np.kron(np.array([[1.0, -1.0], [-1.0, 1.0]]), np.ones((L, L))) * taper
-    kern /= np.abs(kern).sum()
-
-    nov = np.zeros(sim.shape[0])
-    for i in range(L, sim.shape[0] - L):
-        nov[i] = (sim[i - L:i + L, i - L:i + L] * kern).sum()
-    nov = np.maximum(nov, 0)
-    if nov.max() <= 0:
-        return []
-    nov /= nov.max()
-
-    peaks, _ = find_peaks(nov, prominence=prom, distance=int(min_gap / res))
-    if not len(peaks):
-        return []
-
-    # Validate: compare the flanking windows against the track's own
-    # typical window-to-window variation.
-    def _vec(a, b):
-        i, j = int(a * fps), int(b * fps)
-        i, j = max(0, i), min(feat.shape[1], j)
-        if j - i < 10:
-            return None
-        v = feat[:, i:j].mean(axis=1)
-        return v / (np.linalg.norm(v) + 1e-9)
-
-    total = feat.shape[1] / fps
-    base = []
-    for t in np.arange(ctx, max(ctx, total - 2 * ctx), ctx):
-        u, v = _vec(t - ctx, t), _vec(t, t + ctx)
-        if u is not None and v is not None:
-            base.append(1 - float(u @ v))
-    baseline = float(np.median(base)) if base else 0.0
-
-    kept = []
-    for p in peaks:
-        t = p * res
-        u, v = _vec(t - ctx, t), _vec(t, t + ctx)
-        if u is None or v is None:
-            continue
-        d = 1 - float(u @ v)
-        if baseline <= 0 or d / baseline >= ratio:
-            kept.append(t)
-    return kept
-
-
 def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
                 win=1.0, hop_sec=1.0, music_only=False, subdivide=True):
     """Split a concert recording into individual songs.
@@ -795,107 +552,6 @@ def split_songs(audio_path, out_dir, min_song=45.0, pad=1.0,
         print(f"Wrote {n_song} songs and {n_talk} spoken passages to {out_dir}/")
 
 
-def split_tracks(audio_path, out_dir, silence_db=35, min_silence=3.0,
-                 min_track=20.0, pad=0.5, cough_tol=1.0):
-    """Split a long recording into individual tracks at quiet gaps.
-
-    The gaps between tracks are rarely true silence -- there are coughs,
-    shuffles and ambient noise. So instead of strict silence detection we
-    look for *sustained low-energy* regions and tolerate brief loud blips
-    (coughs) inside them.
-
-    silence_db   - how many dB below the loud content counts as "quiet"
-    min_silence  - minimum sustained quiet length (s) that marks a boundary
-    min_track    - drop segments shorter than this (s)
-    pad          - padding (s) kept around each track's edges
-    cough_tol    - bridge over loud blips (coughs) up to this long (s)
-                   so a single cough doesn't break up a quiet gap
-    """
-    y, sr = librosa.load(audio_path, sr=None, mono=False)
-    if y.ndim == 1:
-        y = y[np.newaxis, :]
-
-    mono = y.mean(axis=0)
-
-    # Frame-level loudness in dB relative to the recording's loud content.
-    hop = 512
-    frame = 2048
-    rms = librosa.feature.rms(y=mono, frame_length=frame, hop_length=hop)[0]
-    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
-
-    # Reference the "loud" level robustly (95th pct), not the single peak,
-    # so a stray transient doesn't skew the threshold.
-    loud = np.percentile(rms_db, 95)
-    quiet = rms_db < (loud - silence_db)
-
-    sec_per_frame = hop / sr
-    cough_frames = int(round(cough_tol / sec_per_frame))
-    min_gap_frames = int(round(min_silence / sec_per_frame))
-
-    # Morphological closing: fill short non-quiet holes (coughs) so they
-    # don't break an otherwise continuous quiet gap.
-    closed = quiet.copy()
-    i = 0
-    n = len(closed)
-    while i < n:
-        if not closed[i]:
-            j = i
-            while j < n and not closed[j]:
-                j += 1
-            run = j - i
-            # Only bridge if flanked by quiet on both sides.
-            if run <= cough_frames and i > 0 and j < n and closed[i - 1] and closed[j]:
-                closed[i:j] = True
-            i = j
-        else:
-            i += 1
-
-    # Find sustained quiet runs >= min_silence -> these are boundary gaps.
-    gaps = []
-    i = 0
-    while i < n:
-        if closed[i]:
-            j = i
-            while j < n and closed[j]:
-                j += 1
-            if (j - i) >= min_gap_frames:
-                # Cut at the middle of the gap.
-                mid = (i + j) // 2
-                gaps.append(mid)
-            i = j
-        else:
-            i += 1
-
-    # Build track spans between consecutive gap midpoints.
-    cut_samples = [0] + [int(g * hop) for g in gaps] + [y.shape[1]]
-    spans = [(cut_samples[k], cut_samples[k + 1]) for k in range(len(cut_samples) - 1)]
-
-    pad_samples = int(pad * sr)
-    min_track_samples = int(min_track * sr)
-
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(audio_path))[0]
-
-    count = 0
-    for start, end in spans:
-        if end - start < min_track_samples:
-            continue
-        s = max(0, start - pad_samples)
-        e = min(y.shape[1], end + pad_samples)
-        track = y[:, s:e]
-        if track.shape[0] == 1:
-            track = track[0]
-        count += 1
-        out_path = os.path.join(out_dir, f"{base}_track_{count:02d}.flac")
-        _write_audio(out_path, track, sr)
-        print(f"  Track {count:02d}: {s / sr:8.1f}s - {e / sr:8.1f}s  ({(e - s) / sr:6.1f}s)  -> {out_path}")
-
-    if count == 0:
-        print("No tracks found. Try lowering --silence-db or --min-silence.")
-    else:
-        print(f"Found {len(gaps)} gaps -> wrote {count} tracks to {out_dir}/")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Detect and remove unwanted audio events")
     parser.add_argument("input", nargs="?", help="Input audio file")
@@ -903,7 +559,6 @@ def main():
     parser.add_argument("--events-csv", help="Path to save/load events CSV")
     parser.add_argument("--detect-only", action="store_true", help="Only detect events, don't clean audio")
     parser.add_argument("--use-existing-events", help="Use events from an existing CSV instead of detecting")
-    parser.add_argument("--split", action="store_true", help="Split input into individual tracks at silent gaps")
     parser.add_argument("--split-songs", action="store_true",
                         help="Split a concert into individual songs using music vs. applause/speech boundaries")
     parser.add_argument("--no-subdivide", action="store_true",
@@ -912,22 +567,11 @@ def main():
                         help="Write only musical passages, skipping the spoken sections between them")
     parser.add_argument("--min-song", type=float, default=45.0,
                         help="Drop songs shorter than this many seconds (default: 45)")
-    parser.add_argument("--out-dir", default="tracks", help="Output directory for --split (default: tracks)")
-    parser.add_argument("--silence-db", type=float, default=35, help="dB below loud content treated as quiet (default: 35)")
-    parser.add_argument("--min-silence", type=float, default=3.0, help="Min sustained quiet in seconds marking a track boundary (default: 3.0)")
-    parser.add_argument("--min-track", type=float, default=20.0, help="Drop tracks shorter than this many seconds (default: 20)")
-    parser.add_argument("--cough-tol", type=float, default=1.0, help="Bridge over loud blips (coughs) up to this long in seconds (default: 1.0)")
-    parser.add_argument("--sensitivity", choices=sorted(SENSITIVITY_PRESETS), default="strict",
-                        help="Detection sensitivity preset; looser flags more events (default: strict)")
-    parser.add_argument("--multi-pass", action="store_true",
-                        help="Run detection at every sensitivity level and save one events CSV per level for comparison")
-    parser.add_argument("--method", choices=["inpaint", "stem", "cut"], default="inpaint",
-                        help="How to clean events: 'inpaint' removes only the noise energy and keeps music/voice "
-                             "underneath (highest fidelity, no level dip); 'stem' swaps in Demucs music-only audio; "
-                             "'cut' splices them out (default: inpaint)")
-    parser.add_argument("--detector", choices=["panns", "spectral"], default="panns",
-                        help="Event detector: 'panns' recognises cough/throat-clearing/sneeze via a pretrained "
-                             "AudioSet model; 'spectral' uses the loudness/noisiness heuristic (default: panns)")
+    parser.add_argument("--out-dir", default="songs",
+                        help="Output directory for --split-songs (default: songs)")
+    parser.add_argument("--method", choices=["inpaint", "cut"], default="inpaint",
+                        help="How to clean events: 'inpaint' removes only the noise energy and keeps "
+                             "music and voice underneath; 'cut' splices the range out (default: inpaint)")
     parser.add_argument("--keep-lossy", action="store_true",
                         help="Honour a .mp3/.ogg output path instead of redirecting to FLAC. "
                              "Only for final delivery -- it re-encodes the whole recording")
@@ -936,38 +580,10 @@ def main():
                              "True coughs score ~0.5-0.7; music sits below ~0.1")
     args = parser.parse_args()
 
-    if args.multi_pass:
-        base = os.path.splitext(os.path.basename(args.input))[0]
-        print(f"Multi-pass detection on {args.input}...")
-        results = {}
-        for level in ["strict", "medium", "loose"]:
-            events = detect_events(args.input, sensitivity=level)
-            csv_path = f"{base}_events_{level}.csv"
-            save_events_csv(events, csv_path)
-            total = sum(e - s for s, e in events)
-            results[level] = (len(events), total, csv_path)
-            print(f"  {level:>6}: {len(events):3d} events, {total:7.1f}s flagged -> {csv_path}")
-        print("\nCompare the CSVs (or spot-check clips), then clean with the level you like:")
-        best = results["strict"][2]
-        print(f"  python clean_audio.py '{args.input}' output.mp3 --use-existing-events {best}")
-        return
-
     if args.split_songs:
         print(f"Splitting {args.input} into songs...")
         split_songs(args.input, args.out_dir, min_song=args.min_song,
                     music_only=args.music_only, subdivide=not args.no_subdivide)
-        return
-
-    if args.split:
-        print(f"Splitting {args.input} into tracks...")
-        split_tracks(
-            args.input,
-            args.out_dir,
-            silence_db=args.silence_db,
-            min_silence=args.min_silence,
-            min_track=args.min_track,
-            cough_tol=args.cough_tol,
-        )
         return
 
     if not args.detect_only and not args.output:
@@ -978,12 +594,8 @@ def main():
         events = load_events_csv(args.use_existing_events)
         print(f"Loaded {len(events)} events")
     else:
-        if args.detector == "panns":
-            print(f"Detecting events in {args.input} (PANNs, threshold {args.threshold})...")
-            events = detect_events_panns(args.input, threshold=args.threshold)
-        else:
-            print(f"Detecting events in {args.input} (spectral, sensitivity: {args.sensitivity})...")
-            events = detect_events(args.input, sensitivity=args.sensitivity)
+        print(f"Detecting events in {args.input} (threshold {args.threshold})...")
+        events = detect_events_panns(args.input, threshold=args.threshold)
         print(f"Detected {len(events)} events")
 
     if args.events_csv:
@@ -1004,8 +616,6 @@ def main():
     print(f"Cleaning audio -> {args.output} (method: {args.method})")
     if args.method == "inpaint":
         inpaint_events(args.input, args.output, events)
-    elif args.method == "stem":
-        repair_events(args.input, args.output, events)
     else:
         remove_events(args.input, args.output, events)
     print("Done.")

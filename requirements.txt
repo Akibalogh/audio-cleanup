@@ -1,11 +1,9 @@
 # Core
 librosa>=0.10
 numpy
+scipy
 soundfile
 
-# Default detector (--detector panns) and song splitting
+# Detection and song splitting (model checkpoint downloads on first use)
 panns-inference
 torch>=2.0
-
-# Optional: --method stem
-demucs>=4.0
