@@ -6,6 +6,9 @@ into individual songs.
 
 Everything lives in one script: [`clean_audio.py`](clean_audio.py).
 
+[`WORKFLOW.md`](WORKFLOW.md) is the step-by-step runbook for processing a
+recording end to end, including what was tried and rejected.
+
 ## Requirements
 
 - Python 3.9+
